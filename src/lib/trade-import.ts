@@ -1,6 +1,14 @@
 import Papa from "papaparse"
 import * as XLSX from "xlsx"
 
+const XLSX_READ_OPTIONS: XLSX.ParsingOptions = {
+  type: "array",
+  cellStyles: false,
+  cellHTML: false,
+  bookVBA: false,
+  sheetRows: 50_000,
+}
+
 export interface TradeRecord {
   date: string // YYYY-MM-DD
   time?: string
@@ -929,14 +937,14 @@ export function parseTradeExcel(arrayBuffer: ArrayBuffer, fileName?: string): Tr
   }
 
   // 第一次尝试默认解析
-  let workbook = XLSX.read(arrayBuffer, { type: "array" })
+  let workbook = XLSX.read(arrayBuffer, XLSX_READ_OPTIONS)
   let sheet = workbook.Sheets[workbook.SheetNames[0]]
   rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1 })
 
   // 如果找不到表头，尝试用中文 codepage 936 重新解析
   if (!findHeaderRow(rows)) {
     try {
-      workbook = XLSX.read(arrayBuffer, { type: "array", codepage: 936 })
+      workbook = XLSX.read(arrayBuffer, { ...XLSX_READ_OPTIONS, codepage: 936 })
       sheet = workbook.Sheets[workbook.SheetNames[0]]
       rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1 })
     } catch {}

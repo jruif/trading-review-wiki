@@ -1,4 +1,3 @@
-use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use arrow_array::{Float32Array, RecordBatch, StringArray, FixedSizeListArray, ArrayRef};
 use arrow_schema::{DataType, Field, Schema};
@@ -6,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use crate::path_guard;
+use crate::vector_db;
 
 /// Result from vector search
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -105,11 +107,9 @@ pub async fn vector_upsert(
     embedding: Vec<f32>,
 ) -> Result<(), String> {
     validate_page_id(&page_id)?;
+    path_guard::assert_readable(&project_path)?;
 
-    let db = connect(&db_path(&project_path))
-        .execute()
-        .await
-        .map_err(|e| format!("DB connect error: {e}"))?;
+    let db = vector_db::get_connection(&project_path).await?;
 
     let dim = embedding.len() as i32;
     let schema = make_schema(dim);
@@ -153,10 +153,8 @@ pub async fn vector_search(
     query_embedding: Vec<f32>,
     top_k: usize,
 ) -> Result<Vec<VectorSearchResult>, String> {
-    let db = connect(&db_path(&project_path))
-        .execute()
-        .await
-        .map_err(|e| format!("DB connect error: {e}"))?;
+    path_guard::assert_readable(&project_path)?;
+    let db = vector_db::get_connection(&project_path).await?;
 
     let tables = db.table_names()
         .execute()
@@ -217,11 +215,9 @@ pub async fn vector_delete(
     page_id: String,
 ) -> Result<(), String> {
     validate_page_id(&page_id)?;
+    path_guard::assert_readable(&project_path)?;
 
-    let db = connect(&db_path(&project_path))
-        .execute()
-        .await
-        .map_err(|e| format!("DB connect error: {e}"))?;
+    let db = vector_db::get_connection(&project_path).await?;
 
     let tables = db.table_names()
         .execute()
@@ -249,10 +245,8 @@ pub async fn vector_delete(
 pub async fn vector_count(
     project_path: String,
 ) -> Result<usize, String> {
-    let db = connect(&db_path(&project_path))
-        .execute()
-        .await
-        .map_err(|e| format!("DB connect error: {e}"))?;
+    path_guard::assert_readable(&project_path)?;
+    let db = vector_db::get_connection(&project_path).await?;
 
     let tables = db.table_names()
         .execute()
@@ -280,6 +274,7 @@ pub async fn vector_count(
 pub async fn vector_stats(
     project_path: String,
 ) -> Result<VectorStoreStats, String> {
+    path_guard::assert_readable(&project_path)?;
     let db_path_string = db_path(&project_path);
     let db_root = Path::new(&db_path_string);
     let table_root = table_path(&project_path);
@@ -298,7 +293,7 @@ pub async fn vector_stats(
         return Ok(stats);
     }
 
-    match connect(&db_path_string).execute().await {
+    match vector_db::get_connection(&project_path).await {
         Ok(db) => match db.table_names().execute().await {
             Ok(tables) => {
                 stats.table_exists = tables.contains(&TABLE_NAME.to_string());
@@ -325,11 +320,14 @@ pub async fn vector_stats(
 pub async fn vector_clear(
     project_path: String,
 ) -> Result<(), String> {
+    path_guard::assert_writable(&project_path)?;
     let db_path_string = db_path(&project_path);
     let db_root = Path::new(&db_path_string);
     if !db_root.exists() {
         return Ok(());
     }
     fs::remove_dir_all(db_root)
-        .map_err(|e| format!("Failed to clear vector store '{}': {e}", db_path_string))
+        .map_err(|e| format!("Failed to clear vector store '{}': {e}", db_path_string))?;
+    vector_db::invalidate_connection(&project_path);
+    Ok(())
 }

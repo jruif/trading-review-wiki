@@ -4,6 +4,7 @@ mod path_guard;
 mod secrets;
 mod settings;
 mod types;
+mod vector_db;
 
 #[tauri::command]
 fn clip_server_status() -> String {

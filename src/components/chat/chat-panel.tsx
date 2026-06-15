@@ -3,13 +3,14 @@ import { BookOpen, Plus, Trash2, MessageSquare } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ChatMessage, StreamingMessage, useSourceFiles } from "./chat-message"
 import { ChatInput } from "./chat-input"
-import { useChatStore, chatMessagesToLLM } from "@/stores/chat-store"
+import { useChatStore, chatMessagesToLLM, selectStreamingContent } from "@/stores/chat-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage as LLMMessage } from "@/lib/llm-client"
 import { executeIngestWrites } from "@/lib/ingest"
 import { listDirectory, readFile, writeFile, deleteFile, writeBinaryFile, createDirectory } from "@/commands/fs"
 import { searchWiki } from "@/lib/search"
 import { buildRetrievalGraph, getRelatedNodes } from "@/lib/graph-relevance"
+import { mapWithConcurrency } from "@/lib/concurrency"
 import { useReviewStore } from "@/stores/review-store"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath, getFileName, getRelativePath } from "@/lib/path-utils"
@@ -121,7 +122,7 @@ export function ChatPanel() {
   useSourceFiles() // Keep source file cache warm
   const activeConversationId = useChatStore((s) => s.activeConversationId)
   const isStreaming = useChatStore((s) => s.isStreaming)
-  const streamingContent = useChatStore((s) => s.streamingContent)
+  const streamingContent = useChatStore(selectStreamingContent)
   const mode = useChatStore((s) => s.mode)
   const addMessage = useChatStore((s) => s.addMessage)
   const setStreaming = useChatStore((s) => s.setStreaming)
@@ -276,39 +277,52 @@ export function ChatPanel() {
         const relevantPages: PageEntry[] = []
 
         const addedPaths = new Set<string>()
-        const tryAddPage = async (title: string, filePath: string, priority: number): Promise<boolean> => {
-          if (usedChars >= PAGE_BUDGET) return false
-          const normPath = normalizePath(filePath)
-          if (addedPaths.has(normPath)) return false
-          try {
-            const raw = await readFile(filePath)
-            const relativePath = getRelativePath(filePath, pp)
-            const truncated = raw.length > MAX_PAGE_SIZE
-              ? raw.slice(0, MAX_PAGE_SIZE) + "\n\n[...truncated...]"
-              : raw
-            if (usedChars + truncated.length > PAGE_BUDGET) return false
-            usedChars += truncated.length
-            addedPaths.add(normPath)
-            relevantPages.push({ title, path: relativePath, content: truncated, priority })
-            return true
-          } catch { return false }
+        type PageCandidate = { title: string; path: string; priority: number }
+        const pageCandidates: PageCandidate[] = [
+          ...allSearchHits.filter((r) => r.titleMatch).map((r) => ({ title: r.title, path: r.path, priority: 0 })),
+          ...allSearchHits.filter((r) => !r.titleMatch).map((r) => ({ title: r.title, path: r.path, priority: 1 })),
+          ...graphExpansions.map((exp) => ({ title: exp.title, path: exp.path, priority: 2 })),
+        ]
+        if (pageCandidates.length === 0) {
+          pageCandidates.push({ title: "Overview", path: `${pp}/wiki/overview.md`, priority: 3 })
         }
 
-        // P0: Title matches (from all search results, not just top 10)
-        for (const r of allSearchHits.filter((r) => r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 0)
+        const dedupedCandidates: PageCandidate[] = []
+        const seenCandidatePaths = new Set<string>()
+        for (const candidate of pageCandidates) {
+          const normPath = normalizePath(candidate.path)
+          if (seenCandidatePaths.has(normPath)) continue
+          seenCandidatePaths.add(normPath)
+          dedupedCandidates.push(candidate)
         }
-        // P1: Content matches (from all search results)
-        for (const r of allSearchHits.filter((r) => !r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 1)
-        }
-        // P2: Graph expansions
-        for (const exp of graphExpansions) {
-          await tryAddPage(exp.title, exp.path, 2)
-        }
-        // P3: Overview fallback
-        if (relevantPages.length === 0) {
-          await tryAddPage("Overview", `${pp}/wiki/overview.md`, 3)
+
+        const loadedPages = await mapWithConcurrency(dedupedCandidates, 6, async (candidate) => {
+          try {
+            const raw = await readFile(candidate.path)
+            const normPath = normalizePath(candidate.path)
+            return { ...candidate, normPath, raw }
+          } catch {
+            return null
+          }
+        })
+
+        for (const item of loadedPages) {
+          if (!item) continue
+          if (usedChars >= PAGE_BUDGET) break
+          if (addedPaths.has(item.normPath)) continue
+          const relativePath = getRelativePath(item.path, pp)
+          const truncated = item.raw.length > MAX_PAGE_SIZE
+            ? item.raw.slice(0, MAX_PAGE_SIZE) + "\n\n[...truncated...]"
+            : item.raw
+          if (usedChars + truncated.length > PAGE_BUDGET) continue
+          usedChars += truncated.length
+          addedPaths.add(item.normPath)
+          relevantPages.push({
+            title: item.title,
+            path: relativePath,
+            content: truncated,
+            priority: item.priority,
+          })
         }
 
         const pagesContext = relevantPages.length > 0

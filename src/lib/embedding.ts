@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core"
 import type { EmbeddingConfig } from "@/stores/wiki-store"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
+import { mapWithConcurrency } from "@/lib/concurrency"
 
 // ── Embedding API ─────────────────────────────────────────────────────────
 
@@ -155,7 +156,7 @@ export async function embedAllPages(
   walk(tree)
 
   let done = 0
-  for (const file of mdFiles) {
+  await mapWithConcurrency(mdFiles, 4, async (file) => {
     try {
       const content = await readFile(file.path)
       const titleMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
@@ -168,11 +169,11 @@ export async function embedAllPages(
       }
     } catch (err) {
       console.warn(`[Embedding] Failed to embed page "${file.id}":`, err)
+    } finally {
+      done++
+      if (onProgress) onProgress(done, mdFiles.length)
     }
-
-    done++
-    if (onProgress) onProgress(done, mdFiles.length)
-  }
+  })
 
   return done
 }

@@ -27,7 +27,7 @@ interface ChatState {
   activeConversationId: string | null
   messages: DisplayMessage[]
   isStreaming: boolean
-  streamingContent: string
+  streamingChunks: string[]
   mode: "chat" | "ingest"
   ingestSource: string | null
   maxHistoryMessages: number
@@ -71,7 +71,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activeConversationId: null,
   messages: [],
   isStreaming: false,
-  streamingContent: "",
+  streamingChunks: [],
   mode: "chat",
   ingestSource: null,
   maxHistoryMessages: 10,
@@ -156,11 +156,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setConversations: (conversations) => set({ conversations }),
 
-  setStreaming: (isStreaming) => set({ isStreaming }),
+  setStreaming: (isStreaming) =>
+    set(isStreaming ? { isStreaming } : { isStreaming, streamingChunks: [] }),
 
   appendStreamToken: (token) =>
     set((state) => ({
-      streamingContent: state.streamingContent + token,
+      streamingChunks: [...state.streamingChunks, token],
     })),
 
   finalizeStream: (content, references) =>
@@ -169,7 +170,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (!activeConversationId) {
         return {
           isStreaming: false,
-          streamingContent: "",
+          streamingChunks: [],
         }
       }
 
@@ -184,7 +185,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       return {
         isStreaming: false,
-        streamingContent: "",
+        streamingChunks: [],
         messages: [...state.messages, newMessage],
         conversations: conversations.map((c) =>
           c.id === activeConversationId
@@ -213,7 +214,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       activeConversationId: null,
       messages: [],
       isStreaming: false,
-      streamingContent: "",
+      streamingChunks: [],
       mode: "chat",
       ingestSource: null,
       lastQueryPages: [],
@@ -241,6 +242,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return messages.filter((m) => m.conversationId === activeConversationId)
   },
 }))
+
+export function selectStreamingContent(state: ChatState): string {
+  return state.streamingChunks.join("")
+}
 
 export function chatMessagesToLLM(messages: DisplayMessage[]): ChatMessage[] {
   return messages.map((m) => ({

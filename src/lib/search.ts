@@ -1,6 +1,7 @@
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
+import { mapWithConcurrency } from "@/lib/concurrency"
 
 export interface SearchResult {
   path: string
@@ -549,12 +550,12 @@ async function searchFiles(
   results: SearchResult[],
   mode: SearchMode,
 ): Promise<void> {
-  for (const file of files) {
+  const scanned = await mapWithConcurrency(files, 8, async (file) => {
     let content = ""
     try {
       content = await readFile(file.path)
     } catch {
-      continue
+      return null
     }
 
     const title = extractTitle(content, file.name)
@@ -565,12 +566,11 @@ async function searchFiles(
     const contentScore = tokenMatchScore(content, tokens)
     const frontmatterScore = tokenMatchScore(fmText, tokens) * 4 + topicCoverageBonus(fmText, tokens)
 
-    if (titleScore === 0 && contentScore === 0 && frontmatterScore === 0) continue
+    if (titleScore === 0 && contentScore === 0 && frontmatterScore === 0) return null
 
     const isTitleMatch = titleScore > 0
     let score = contentScore + frontmatterScore + topicCoverageBonus(content, tokens) + (isTitleMatch ? TITLE_MATCH_BONUS + titleScore : 0)
 
-    // Boost raw sources so recent 交割单/日复盘 don't get buried by wiki pages
     const isRaw = file.path.includes("/raw/") || file.path.includes("\\raw\\")
     if (isRaw && score > 0) {
       score += RAW_BONUS
@@ -578,11 +578,10 @@ async function searchFiles(
     }
 
     if (mode === "ask") {
-      // Recency boost is ask-only. Ingest candidate retrieval stays conservative and high-recall.
       const freshness = frontmatterFreshnessScore(content, file.path, query)
       score += getRecencyBoost(file.name, query)
       score += freshness.score
-      results.push({
+      return {
         path: file.path,
         title,
         snippet: buildSnippet(content, preferredEvidenceTokens(tokens).find((t) =>
@@ -595,22 +594,25 @@ async function searchFiles(
         frontmatterUpdatedField: freshness.field,
         staleDays: freshness.staleDays,
         freshnessScore: freshness.score,
-      })
-      continue
+      } satisfies SearchResult
     }
 
     const firstMatchingToken = preferredEvidenceTokens(tokens).find((t) =>
       content.toLowerCase().includes(t.toLowerCase()),
     ) ?? query
-    const snippet = buildSnippet(content, firstMatchingToken)
 
-    results.push({
+    return {
       path: file.path,
       title,
-      snippet,
+      snippet: buildSnippet(content, firstMatchingToken),
       titleMatch: isTitleMatch,
       score,
       retrievalMode: mode,
-    })
+    } satisfies SearchResult
+  })
+
+  for (const result of scanned) {
+    if (result) results.push(result)
   }
 }
+
