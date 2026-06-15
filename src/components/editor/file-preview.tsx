@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
+import rehypeSanitize from "rehype-sanitize"
 import "katex/dist/katex.min.css"
 import {
   FileText,
@@ -173,7 +174,7 @@ function TextPreview({ filePath, content, label }: { filePath: string; content: 
       <div className="prose prose-sm max-w-none dark:prose-invert">
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkMath]}
-          rehypePlugins={[rehypeKatex]}
+          rehypePlugins={[rehypeKatex, rehypeSanitize]}
           components={{
             table: ({ children, ...props }) => (
               <div className="my-2 overflow-x-auto rounded border border-border">

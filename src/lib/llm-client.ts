@@ -138,8 +138,6 @@ export async function streamChat(
     debugLog("error", "llm-client", `Request ${reqId} error`, {
       tokenCount,
       message: e.message,
-      rawResponse: (e as any).rawResponse,
-      parsed: (e as any).parsed,
     })
     callbacks.onError(e)
   }

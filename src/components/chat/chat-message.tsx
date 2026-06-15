@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
+import rehypeSanitize from "rehype-sanitize"
 import "katex/dist/katex.min.css"
 import {
   Bot, User, FileText, BookmarkPlus, ChevronDown, ChevronRight, RefreshCw, Copy, Check,
@@ -663,7 +664,7 @@ function MarkdownContent({ content }: { content: string }) {
       <div className="chat-markdown prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-pre:my-2 prose-code:text-xs prose-code:before:content-none prose-code:after:content-none">
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkMath]}
-          rehypePlugins={[rehypeKatex]}
+          rehypePlugins={[rehypeKatex, rehypeSanitize]}
           components={{
             a: ({ href, children }) => {
               if (href?.startsWith("wikilink:")) {

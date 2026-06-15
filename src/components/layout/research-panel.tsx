@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
+import rehypeSanitize from "rehype-sanitize"
 import "katex/dist/katex.min.css"
 import {
   Search, Loader2, CheckCircle2, AlertCircle, ChevronRight, ChevronDown, X,
@@ -175,7 +176,7 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
         {answer && (
           <ReactMarkdown
             remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[rehypeKatex]}
+            rehypePlugins={[rehypeKatex, rehypeSanitize]}
             components={{
               table: ({ children, ...props }) => (
                 <div className="my-2 overflow-x-auto rounded border border-border">
@@ -327,7 +328,7 @@ function ResearchTaskCard({ task, onRemove }: { task: ResearchTask; onRemove: (i
               <div className="rounded bg-muted/30 p-2 prose prose-xs dark:prose-invert max-w-none" style={{ maxHeight: "calc(100vh - 420px)", minHeight: "120px", overflowY: "auto" }}>
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm, remarkMath]}
-                  rehypePlugins={[rehypeKatex]}
+                  rehypePlugins={[rehypeKatex, rehypeSanitize]}
                   components={{
                     table: ({ children, ...props }) => (
                       <div className="my-2 overflow-x-auto rounded border border-border">
