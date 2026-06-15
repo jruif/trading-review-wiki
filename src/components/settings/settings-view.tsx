@@ -32,6 +32,7 @@ import {
   Trash2,
 } from "lucide-react"
 import { previewProviderUrl, testLlmConnection, type LlmTestResult } from "@/lib/llm-test"
+import { getClipPairingCode } from "@/commands/fs"
 
 const PROVIDERS = [
   { value: "openai" as const, label: "OpenAI", models: ["gpt-4o", "gpt-4.1", "gpt-4o-mini"] },
@@ -95,9 +96,17 @@ export function SettingsView() {
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<LlmTestResult | null>(null)
   const [urlCopied, setUrlCopied] = useState(false)
+  const [clipPairingCode, setClipPairingCode] = useState("")
+  const [clipPairingCopied, setClipPairingCopied] = useState(false)
   const appTheme = useWikiStore((s) => s.appTheme)
   const setAppTheme = useWikiStore((s) => s.setAppTheme)
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    getClipPairingCode()
+      .then((code) => setClipPairingCode(code))
+      .catch((err) => console.warn("[Settings] Failed to load clip pairing code:", err))
+  }, [])
 
   useEffect(() => {
     setProvider(llmConfig.provider)
@@ -158,6 +167,17 @@ export function SettingsView() {
       setTestResult(result)
     } finally {
       setTesting(false)
+    }
+  }
+
+  async function handleCopyClipPairingCode() {
+    if (!clipPairingCode) return
+    try {
+      await navigator.clipboard.writeText(clipPairingCode)
+      setClipPairingCopied(true)
+      setTimeout(() => setClipPairingCopied(false), 1500)
+    } catch {
+      // ignore
     }
   }
 
@@ -608,6 +628,30 @@ export function SettingsView() {
                 </p>
               </div>
             )}
+          </div>
+
+          {/* Web Clip extension pairing */}
+          <div className="space-y-4 rounded-lg border p-4">
+            <h3 className="font-semibold">Web Clip 扩展配对</h3>
+            <p className="text-xs text-muted-foreground">
+              在浏览器扩展中输入此配对码，即可获取 Clip 访问令牌。配对码保存在本机，重启应用后不变。
+            </p>
+            <div className="flex items-center gap-2">
+              <Input
+                readOnly
+                value={clipPairingCode || "加载中…"}
+                className="font-mono tracking-widest"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleCopyClipPairingCode}
+                disabled={!clipPairingCode}
+              >
+                {clipPairingCopied ? <Check className="size-4" /> : <Copy className="size-4" />}
+              </Button>
+            </div>
           </div>
 
           {/* Chat History section */}

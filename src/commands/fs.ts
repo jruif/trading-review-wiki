@@ -100,3 +100,7 @@ export async function clipServerStatus(): Promise<string> {
 export async function getClipServerToken(): Promise<string> {
   return invoke<string>("get_clip_server_token")
 }
+
+export async function getClipPairingCode(): Promise<string> {
+  return invoke<string>("get_clip_pairing_code")
+}

@@ -15,6 +15,11 @@ fn get_clip_server_token() -> String {
     clip_server::get_clip_server_token()
 }
 
+#[tauri::command]
+fn get_clip_pairing_code() -> String {
+    clip_server::get_clip_pairing_code()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     clip_server::start_clip_server();
@@ -43,6 +48,7 @@ pub fn run() {
             commands::project::open_project,
             clip_server_status,
             get_clip_server_token,
+            get_clip_pairing_code,
             commands::vectorstore::vector_upsert,
             commands::vectorstore::vector_search,
             commands::vectorstore::vector_delete,

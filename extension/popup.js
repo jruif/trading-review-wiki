@@ -1,4 +1,5 @@
 const API_URL = "http://127.0.0.1:19827";
+const PAIRING_STORAGE_KEY = "clipPairingCode";
 
 const statusBar = document.getElementById("statusBar");
 const titleInput = document.getElementById("titleInput");
@@ -6,15 +7,92 @@ const urlPreview = document.getElementById("urlPreview");
 const contentPreview = document.getElementById("contentPreview");
 const clipBtn = document.getElementById("clipBtn");
 const projectSelect = document.getElementById("projectSelect");
+const pairingInput = document.getElementById("pairingInput");
+const pairingField = document.getElementById("pairingField");
 
 let extractedContent = "";
 let pageUrl = "";
+let clipToken = "";
+let pairingCode = "";
+
+function storageGet(key) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(key, (result) => resolve(result[key]));
+  });
+}
+
+function storageSet(key, value) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [key]: value }, resolve);
+  });
+}
+
+async function loadPairingCode() {
+  const stored = await storageGet(PAIRING_STORAGE_KEY);
+  if (typeof stored === "string" && stored.trim()) {
+    pairingCode = stored.trim();
+    if (pairingInput) pairingInput.value = pairingCode;
+    if (pairingField) pairingField.style.display = "none";
+    return pairingCode;
+  }
+  if (pairingField) pairingField.style.display = "block";
+  return "";
+}
+
+async function savePairingCode(code) {
+  pairingCode = code.trim();
+  await storageSet(PAIRING_STORAGE_KEY, pairingCode);
+  if (pairingField) pairingField.style.display = pairingCode ? "none" : "block";
+}
+
+async function fetchClipToken() {
+  if (!pairingCode) {
+    clipToken = "";
+    return false;
+  }
+  try {
+    const res = await fetch(`${API_URL}/clip-token`, {
+      method: "GET",
+      headers: { "X-Clip-Pairing": pairingCode },
+    });
+    const data = await res.json();
+    if (data.ok && data.token) {
+      clipToken = data.token;
+      return true;
+    }
+  } catch {}
+  clipToken = "";
+  return false;
+}
+
+function authHeaders(extra = {}) {
+  return {
+    ...extra,
+    ...(clipToken ? { "X-Clip-Token": clipToken } : {}),
+  };
+}
 
 async function checkConnection() {
+  await loadPairingCode();
   try {
     const res = await fetch(`${API_URL}/status`, { method: "GET" });
     const data = await res.json();
     if (data.ok) {
+      if (!pairingCode) {
+        statusBar.className = "status disconnected";
+        statusBar.textContent = "✗ Enter pairing code from LLM Wiki Settings";
+        clipBtn.disabled = true;
+        projectSelect.innerHTML = '<option value="">Pairing required</option>';
+        return false;
+      }
+      const authed = await fetchClipToken();
+      if (!authed) {
+        statusBar.className = "status error";
+        statusBar.textContent = "✗ Invalid pairing code — check Settings";
+        clipBtn.disabled = true;
+        if (pairingField) pairingField.style.display = "block";
+        return false;
+      }
       statusBar.className = "status connected";
       statusBar.textContent = "✓ Connected to LLM Wiki";
       await loadProjects();
@@ -30,7 +108,10 @@ async function checkConnection() {
 
 async function loadProjects() {
   try {
-    const res = await fetch(`${API_URL}/projects`, { method: "GET" });
+    const res = await fetch(`${API_URL}/projects`, {
+      method: "GET",
+      headers: authHeaders(),
+    });
     const data = await res.json();
     if (data.ok && data.projects?.length > 0) {
       projectSelect.innerHTML = "";
@@ -46,11 +127,17 @@ async function loadProjects() {
   } catch {}
   // Fallback to current project
   try {
-    const res = await fetch(`${API_URL}/project`, { method: "GET" });
+    const res = await fetch(`${API_URL}/project`, {
+      method: "GET",
+      headers: authHeaders(),
+    });
     const data = await res.json();
     if (data.ok && data.path) {
       const name = data.path.replace(/\\/g, "/").split("/").pop() || data.path;
-      projectSelect.innerHTML = `<option value="${data.path}">${name}</option>`;
+      const opt = document.createElement("option");
+      opt.value = data.path;
+      opt.textContent = name;
+      projectSelect.appendChild(opt);
     }
   } catch {
     projectSelect.innerHTML = '<option value="">No projects</option>';
@@ -207,6 +294,15 @@ async function sendClip() {
     return;
   }
 
+  if (!clipToken) {
+    const ok = await fetchClipToken();
+    if (!ok) {
+      statusBar.className = "status error";
+      statusBar.textContent = "✗ Could not authenticate with LLM Wiki";
+      return;
+    }
+  }
+
   clipBtn.disabled = true;
   statusBar.className = "status sending";
   statusBar.textContent = "⏳ Sending to LLM Wiki...";
@@ -214,7 +310,7 @@ async function sendClip() {
   try {
     const res = await fetch(`${API_URL}/clip`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         title: titleInput.value,
         url: pageUrl,
@@ -243,6 +339,19 @@ async function sendClip() {
 }
 
 clipBtn.addEventListener("click", sendClip);
+
+if (pairingInput) {
+  pairingInput.addEventListener("change", async () => {
+    await savePairingCode(pairingInput.value);
+    await checkConnection();
+  });
+  pairingInput.addEventListener("keydown", async (event) => {
+    if (event.key === "Enter") {
+      await savePairingCode(pairingInput.value);
+      await checkConnection();
+    }
+  });
+}
 
 // Resize content preview to fill available space without causing popup scroll
 function resizePreview() {
