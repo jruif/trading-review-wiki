@@ -1,6 +1,7 @@
 import { appendFile } from "@/commands/fs"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath } from "@/lib/path-utils"
+import { redactSensitiveData } from "@/lib/secrets"
 
 const LOG_FILE = ".llm-wiki/debug.log"
 
@@ -8,9 +9,9 @@ function safeStringify(value: unknown): string {
   if (value === undefined) return ""
   if (typeof value === "string") return value
   try {
-    return JSON.stringify(value, (_, v) => {
+    return JSON.stringify(redactSensitiveData(value), (_, v) => {
       if (v instanceof Error) {
-        return { name: v.name, message: v.message, stack: v.stack }
+        return { name: v.name, message: v.message }
       }
       return v
     }, 2)

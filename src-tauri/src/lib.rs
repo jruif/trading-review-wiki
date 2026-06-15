@@ -1,6 +1,7 @@
 mod clip_server;
 mod commands;
 mod path_guard;
+mod secrets;
 mod settings;
 mod types;
 
@@ -58,6 +59,9 @@ pub fn run() {
             commands::fs::grant_read_path,
             commands::fs::grant_read_directory,
             commands::fs::read_file_head,
+            secrets::store_secret,
+            secrets::load_secret,
+            secrets::delete_secret,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
