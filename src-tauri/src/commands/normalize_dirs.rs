@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::path_guard;
 
 use chrono::Local;
 use serde::Serialize;
@@ -115,7 +117,7 @@ struct PlannedConflict {
 
 #[tauri::command]
 pub fn normalize_wiki_dirs(project_path: String) -> Result<NormalizeReport, String> {
-    let project = PathBuf::from(&project_path);
+    let project = path_guard::assert_writable(&project_path)?;
     let wiki_dir = project.join("wiki");
     if !wiki_dir.is_dir() {
         return Err(format!("INVALID_PATH wiki/ 目录不存在: {}", wiki_dir.display()));

@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::path_guard;
 
 use chrono::Local;
 use serde::Serialize;
@@ -20,7 +22,7 @@ pub struct BackupResult {
 /// Returns relative paths (forward-slash) under `project_path`, e.g. `wiki/股票/爱迪特.md`.
 #[tauri::command]
 pub fn migrate_wiki_backup(project_path: String) -> Result<BackupResult, String> {
-    let project = PathBuf::from(&project_path);
+    let project = path_guard::assert_writable(&project_path)?;
     let wiki_dir = project.join("wiki");
     if !wiki_dir.is_dir() {
         return Err(format!("INVALID_PATH wiki/ 目录不存在: {}", wiki_dir.display()));

@@ -1,6 +1,18 @@
 import { invoke } from "@tauri-apps/api/core"
 import type { FileNode, WikiProject } from "@/types/wiki"
 
+export async function grantReadPath(path: string): Promise<void> {
+  await invoke<void>("grant_read_path", { path })
+}
+
+export async function grantReadDirectory(path: string): Promise<void> {
+  await invoke<void>("grant_read_directory", { path })
+}
+
+export async function readFileHead(path: string, maxBytes?: number): Promise<string> {
+  return invoke<string>("read_file_head", { path, maxBytes })
+}
+
 export async function readFile(path: string): Promise<string> {
   return invoke<string>("read_file", { path })
 }

@@ -5,7 +5,7 @@ import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, Chev
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
-import { copyFile, listDirectory, readFile, readFileBinary, writeFile, deleteFile, findRelatedWikiPages, preprocessFile, createDirectory, parseTradeExcel as parseTradeExcelBackend } from "@/commands/fs"
+import { copyFile, grantReadPath, grantReadDirectory, listDirectory, readFile, readFileBinary, writeFile, deleteFile, findRelatedWikiPages, preprocessFile, createDirectory, parseTradeExcel as parseTradeExcelBackend } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { startIngest } from "@/lib/ingest"
 import { enqueueIngest, enqueueBatch } from "@/lib/ingest-queue"
@@ -110,6 +110,7 @@ export function SourcesView() {
       const originalName = getFileName(sourcePath) || "unknown"
       const destPath = await getUniqueDestPath(`${pp}/raw/sources`, originalName)
       try {
+        await grantReadPath(sourcePath)
         await copyFile(sourcePath, destPath)
         importedPaths.push(destPath)
         // Pre-process file (extract text from PDF, etc.) for instant preview later
@@ -148,6 +149,7 @@ export function SourcesView() {
     const destDir = `${pp}/raw/sources/${folderName}`
 
     try {
+      await grantReadDirectory(selected)
       // Recursively copy the folder
       const copiedFiles: string[] = await invoke("copy_directory", {
         source: selected,
@@ -256,6 +258,7 @@ export function SourcesView() {
         let previewNeeded = false
 
         try {
+          await grantReadPath(sourcePath)
           if (ext === "csv" || ext === "txt") {
             // Read as binary to detect encoding (GBK vs UTF-8)
             const buffer = await readFileBinary(sourcePath)

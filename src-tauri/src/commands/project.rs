@@ -3,6 +3,7 @@ use std::path::Path;
 
 use chrono::Local;
 
+use crate::path_guard;
 use crate::types::wiki::WikiProject;
 
 #[tauri::command]
@@ -225,10 +226,12 @@ related: []
 }"#;
     write_file_inner(root.join(".obsidian/core-plugins.json"), obsidian_core_plugins)?;
 
-    Ok(WikiProject {
+    let project = WikiProject {
         name,
         path: root.to_string_lossy().to_string(),
-    })
+    };
+    path_guard::register_project_root(&project.path)?;
+    Ok(project)
 }
 
 #[tauri::command]
@@ -263,7 +266,9 @@ pub fn open_project(path: String) -> Result<WikiProject, String> {
         .unwrap_or("Unknown")
         .to_string();
 
-    Ok(WikiProject { name, path })
+    let project = WikiProject { name, path };
+    path_guard::register_project_root(&project.path)?;
+    Ok(project)
 }
 
 fn write_file_inner(path: std::path::PathBuf, contents: &str) -> Result<(), String> {

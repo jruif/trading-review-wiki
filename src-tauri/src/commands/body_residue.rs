@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::path_guard;
 
 use chrono::Local;
 use serde::Serialize;
@@ -18,7 +20,7 @@ pub struct BodyResidueBackupResult {
 /// then enumerate every *.md under wiki/ for TS-side residue cleanup.
 #[tauri::command]
 pub fn body_residue_backup(project_path: String) -> Result<BodyResidueBackupResult, String> {
-    let project = PathBuf::from(&project_path);
+    let project = path_guard::assert_writable(&project_path)?;
     let wiki_dir = project.join("wiki");
     if !wiki_dir.is_dir() {
         return Err(format!("INVALID_PATH wiki/ 目录不存在: {}", wiki_dir.display()));
