@@ -7,6 +7,8 @@ pub struct PgConfig {
     pub user: Option<String>,
     pub password: Option<String>,
     pub database: Option<String>,
+    /// When true, connect with TLS. Defaults to true for non-local hosts.
+    pub use_tls: Option<bool>,
 }
 
 impl PgConfig {

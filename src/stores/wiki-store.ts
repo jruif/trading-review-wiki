@@ -30,6 +30,7 @@ interface PgConfig {
   user: string
   password: string
   database: string
+  useTls: boolean | null
 }
 
 interface WikiState {
@@ -103,6 +104,7 @@ export const useWikiStore = create<WikiState>((set) => ({
     user: "",
     password: "",
     database: "",
+    useTls: null,
   },
 
   setLlmConfig: (llmConfig) => set({ llmConfig }),

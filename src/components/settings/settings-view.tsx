@@ -853,6 +853,7 @@ function PgConfigSection() {
   const [user, setUser] = useState(pgConfig.user)
   const [password, setPassword] = useState(pgConfig.password)
   const [database, setDatabase] = useState(pgConfig.database)
+  const [useTls, setUseTls] = useState<boolean | null>(pgConfig.useTls)
   const [showPassword, setShowPassword] = useState(false)
   const [saving, setSaving] = useState(false)
   const [syncing, setSyncing] = useState(false)
@@ -879,6 +880,7 @@ function PgConfigSection() {
     setUser(pgConfig.user)
     setPassword(pgConfig.password)
     setDatabase(pgConfig.database)
+    setUseTls(pgConfig.useTls)
   }, [pgConfig])
 
   useEffect(() => {
@@ -893,6 +895,7 @@ function PgConfigSection() {
       user: user.trim(),
       password,
       database: database.trim(),
+      useTls,
     }
   }
 
@@ -1004,6 +1007,15 @@ function PgConfigSection() {
               {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
             </button>
           </div>
+        </div>
+        <div className="col-span-2 flex items-center gap-2">
+          <input
+            id="pgUseTls"
+            type="checkbox"
+            checked={useTls ?? false}
+            onChange={(e) => setUseTls(e.target.checked)}
+          />
+          <Label htmlFor="pgUseTls">使用 TLS 连接（远程数据库建议开启；本机 localhost 可关闭）</Label>
         </div>
       </div>
 

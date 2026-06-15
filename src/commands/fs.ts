@@ -9,6 +9,17 @@ export async function grantReadDirectory(path: string): Promise<void> {
   await invoke<void>("grant_read_directory", { path })
 }
 
+export interface WikiGraphNodeScan {
+  title: string
+  type: string
+  sources: string[]
+  wikilinks: string[]
+}
+
+export async function scanWikiGraphNode(path: string): Promise<WikiGraphNodeScan> {
+  return invoke<WikiGraphNodeScan>("scan_wiki_graph_node", { path })
+}
+
 export async function readFileHead(path: string, maxBytes?: number): Promise<string> {
   return invoke<string>("read_file_head", { path, maxBytes })
 }

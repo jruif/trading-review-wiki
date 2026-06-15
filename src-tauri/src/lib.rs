@@ -66,6 +66,7 @@ pub fn run() {
             commands::fs::grant_read_path,
             commands::fs::grant_read_directory,
             commands::fs::read_file_head,
+            commands::wiki_graph::scan_wiki_graph_node,
             secrets::store_secret,
             secrets::load_secret,
             secrets::delete_secret,

@@ -7,3 +7,4 @@ pub mod normalize_dirs;
 pub mod project;
 pub mod stock_codes;
 pub mod vectorstore;
+pub mod wiki_graph;

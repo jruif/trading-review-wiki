@@ -13,6 +13,7 @@ interface RustPgConfig {
   user: string | null
   password: string | null
   database: string | null
+  use_tls: boolean | null
 }
 
 function toRustPgConfig(cfg: PgConfig): RustPgConfig {
@@ -22,6 +23,7 @@ function toRustPgConfig(cfg: PgConfig): RustPgConfig {
     user: cfg.user || null,
     password: cfg.password || null,
     database: cfg.database || null,
+    use_tls: cfg.useTls,
   }
 }
 

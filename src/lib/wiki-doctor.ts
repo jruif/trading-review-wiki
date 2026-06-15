@@ -729,7 +729,7 @@ export async function executePlan(
 ): Promise<DoctorResult> {
   const pp = normalizePath(wikiPath)
   const timestamp = Date.now()
-  const backupPath = `${pp}/../wiki-backup-${timestamp}`
+  const backupPath = `${pp}/.llm-wiki/backups/wiki-backup-${timestamp}`
   const errors: string[] = []
   let operationsApplied = 0
 

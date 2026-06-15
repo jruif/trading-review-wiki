@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Local, TimeZone};
+use rustls::client::ClientConfig;
+use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
-use tokio_postgres::NoTls;
+use tokio_postgres::{Client, NoTls};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::path_guard;
 use crate::settings::PgConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,12 +65,58 @@ fn get_or_load(project_path: &str) -> Option<StockCodeFile> {
     Some(file)
 }
 
+fn is_local_pg_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+fn should_use_tls(pg_config: &PgConfig) -> bool {
+    if let Some(use_tls) = pg_config.use_tls {
+        return use_tls;
+    }
+    !is_local_pg_host(pg_config.host.as_deref().unwrap_or(""))
+}
+
+async fn connect_pg(pg_config: &PgConfig) -> Result<Client, String> {
+    let conn_str = pg_config
+        .connection_string()
+        .ok_or_else(|| "INVALID_PATH PG 配置未填写".to_string())?;
+
+    if should_use_tls(pg_config) {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(Arc::new(roots))
+            .with_no_client_auth();
+        let tls = MakeRustlsConnect::new(config);
+        let (client, connection) = tokio_postgres::connect(&conn_str, tls)
+            .await
+            .map_err(|e| format!("TIMEOUT PG TLS 连接失败: {e}"))?;
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("[stock_codes] PG connection terminated: {}", e);
+            }
+        });
+        return Ok(client);
+    }
+
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .map_err(|e| format!("TIMEOUT PG 连接失败: {e}"))?;
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("[stock_codes] PG connection terminated: {}", e);
+        }
+    });
+    Ok(client)
+}
+
 #[tauri::command]
 pub async fn sync_stock_codes(
     project_path: String,
     pg_config: PgConfig,
     force: bool,
 ) -> Result<SyncResult, String> {
+    path_guard::assert_readable(&project_path)?;
     if !force {
         if let Some(existing) = load_from_disk(&project_path) {
             if let Some(ts) = parse_synced_at(&existing.synced_at) {
@@ -85,18 +135,7 @@ pub async fn sync_stock_codes(
         }
     }
 
-    let conn_str = pg_config
-        .connection_string()
-        .ok_or_else(|| "INVALID_PATH PG 配置未填写".to_string())?;
-
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .map_err(|e| format!("TIMEOUT PG 连接失败: {}", e))?;
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("[stock_codes] PG connection terminated: {}", e);
-        }
-    });
+    let client = connect_pg(&pg_config).await?;
 
     let rows = client
         .query(
