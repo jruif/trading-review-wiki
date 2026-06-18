@@ -100,7 +100,6 @@ struct PlannedMove {
     src_rel: String,            // wiki/进化/X.md
     dst_rel: String,            // wiki/模式/X.md
     canonical_type: String,     // 模式
-    src_updated: String,        // frontmatter updated
 }
 
 struct PlannedConflict {
@@ -310,12 +309,10 @@ fn build_plan(
             if let Some(&t) = root_alias_map.get(file_name.as_str()) {
                 let dst_rel = format!("wiki/{}/{}", t, file_name);
                 let src_rel = format!("wiki/{}", file_name);
-                let updated = read_updated_field(&path).unwrap_or_default();
                 root_moves.push(PlannedMove {
                     src_rel,
                     dst_rel,
                     canonical_type: t.to_string(),
-                    src_updated: updated,
                 });
             } else {
                 uncategorized.push(format!("wiki/{}", file_name));
@@ -340,7 +337,6 @@ fn build_plan(
                 src_rel: winner.0.clone(),
                 dst_rel: dst_rel.clone(),
                 canonical_type: canonical_type.clone(),
-                src_updated: winner.1.clone(),
             });
         }
         // 其余都是 losers → archive

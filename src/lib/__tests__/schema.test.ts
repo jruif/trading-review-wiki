@@ -4,6 +4,8 @@ import {
   cleanSources,
   normalizeTypeAlias,
   normalizeStatusAlias,
+  normalizeWikiTimestamp,
+  coerceWikiPageFrontmatter,
   inferTypeFromPath,
   nowLocalTimestamp,
   parseFrontmatter,
@@ -12,6 +14,7 @@ import {
   SCHEMA_VERSION,
   type WikiFrontmatter,
 } from "../schema"
+import { mergeUpdateFromLlmOutput } from "../ingest"
 
 function buildValid(overrides: Partial<WikiFrontmatter> = {}): WikiFrontmatter {
   return {
@@ -210,6 +213,76 @@ describe("inferTypeFromPath", () => {
 describe("nowLocalTimestamp", () => {
   it("matches the format YYYY-MM-DD HH:mm:ss", () => {
     expect(nowLocalTimestamp()).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+  })
+})
+
+describe("normalizeWikiTimestamp", () => {
+  it("coerces date-only and ISO values", () => {
+    expect(normalizeWikiTimestamp("2026-04-15")).toBe("2026-04-15 00:00:00")
+    expect(normalizeWikiTimestamp("2026-06-15T14:23:07")).toBe("2026-06-15 14:23:07")
+  })
+})
+
+describe("coerceWikiPageFrontmatter", () => {
+  it("fills missing fields and normalizes timestamps", () => {
+    const coerced = coerceWikiPageFrontmatter(
+      { created: "2026-04-15", updated: "2026-04-16" },
+      "wiki/模式/测试模式.md",
+      "# 测试模式\n\n正文段落。",
+      { now: "2026-06-15 10:00:00" },
+    )
+    expect(coerced.schema_version).toBe(1)
+    expect(coerced.title).toBe("测试模式")
+    expect(coerced.type).toBe("模式")
+    expect(coerced.created).toBe("2026-04-15 00:00:00")
+    expect(coerced.updated).toBe("2026-04-16 00:00:00")
+    expect([...(coerced.summary ?? "")].length).toBeGreaterThanOrEqual(50)
+  })
+
+  it("clamps summary longer than 120 chars", () => {
+    const coerced = coerceWikiPageFrontmatter(
+      {
+        schema_version: 1,
+        title: "长摘要页",
+        type: "概念",
+        summary: "中".repeat(150),
+        created: "2026-05-11 14:23:07",
+        updated: "2026-05-11 14:23:07",
+        last_reviewed: "2026-05-11 14:23:07",
+        confidence: "中",
+        status: "活跃",
+      },
+      "wiki/概念/长摘要页.md",
+      "# 长摘要页",
+    )
+    expect([...(coerced.summary ?? "")].length).toBeLessThanOrEqual(120)
+    expect(validate(coerced as WikiFrontmatter).filter((v) => v.fatal)).toEqual([])
+  })
+
+  it("drops invalid related wikilinks instead of failing validation", () => {
+    const coerced = coerceWikiPageFrontmatter(
+      buildValid({ related: ["bad-link", "[[概念/OK]]"] }),
+      "wiki/概念/测试页.md",
+      "# 测试页",
+    )
+    expect(coerced.related).toEqual(["[[概念/OK]]"])
+  })
+})
+
+describe("mergeUpdateFromLlmOutput", () => {
+  it("appends incremental sections and preserves existing body", () => {
+    const existing = serializeFrontmatter(buildValid({ title: "旧页", type: "概念" }), "# 旧页\n\n已有段落。")
+    const merged = mergeUpdateFromLlmOutput(
+      existing,
+      "---FILE: wiki/概念/旧页.md---\n## 新证据\n\n补充内容。\n---END FILE---",
+      "wiki/概念/旧页.md",
+      "2026-06-12-复盘",
+      "2026-06-15 12:00:00",
+    )
+    expect(merged).toContain("已有段落")
+    expect(merged).toContain("## 来自 2026-06-12-复盘 的补充")
+    expect(merged).toContain("补充内容")
+    expect(merged).toContain("2026-06-12-复盘")
   })
 })
 

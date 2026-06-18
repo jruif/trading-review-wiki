@@ -194,15 +194,17 @@ export function SettingsView() {
 
   async function handleSave() {
     const { saveLlmConfig, saveSearchApiConfig, saveEmbeddingConfig } = await import("@/lib/project-store")
-    const newConfig = { provider, apiKey, model, ollamaUrl, customEndpoint, maxContextSize, reasoningEffort }
+    const trimmedKey = apiKey.trim()
+    const finalApiKey = trimmedKey || llmConfig.apiKey
+    const newConfig = { provider, apiKey: finalApiKey, model, ollamaUrl, customEndpoint, maxContextSize, reasoningEffort }
     const newSearchConfig = { provider: searchProvider, apiKey: searchApiKey }
     const newEmbeddingConfig = { enabled: embeddingEnabled, endpoint: embeddingEndpoint, apiKey: embeddingApiKey, model: embeddingModel }
     setSearchApiConfig(newSearchConfig)
     await saveSearchApiConfig(newSearchConfig)
     setEmbeddingConfig(newEmbeddingConfig)
     await saveEmbeddingConfig(newEmbeddingConfig)
-    setLlmConfig(newConfig)
-    await saveLlmConfig(newConfig)
+    const savedLlm = await saveLlmConfig(newConfig)
+    setLlmConfig(savedLlm)
     setSaved(true)
     if (savedTimerRef.current) clearTimeout(savedTimerRef.current)
     savedTimerRef.current = setTimeout(() => setSaved(false), 2000)
@@ -220,7 +222,8 @@ export function SettingsView() {
   }
 
   return (
-    <div className="h-full overflow-auto p-8">
+    <div className="flex h-full flex-col">
+      <div className="min-h-0 flex-1 overflow-y-auto p-8 pb-4">
       <div className="mx-auto max-w-xl">
         <h2 className="mb-6 text-2xl font-bold">{t("settings.title")}</h2>
 
@@ -301,6 +304,20 @@ export function SettingsView() {
                     {p.label}
                   </button>
                 ))}
+              </div>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setProvider("openai")
+                    setCustomEndpoint("https://api.deepseek.com/v1")
+                    setModel("deepseek-chat")
+                  }}
+                >
+                  DeepSeek 预设
+                </Button>
               </div>
             </div>
 
@@ -410,6 +427,11 @@ export function SettingsView() {
                         : t("settings.apiKeyPlaceholder", { provider: currentProvider?.label })
                     }
                   />
+                  {llmConfig.apiKey && !apiKey && (
+                    <p className="text-xs text-muted-foreground">
+                      已保存 API Key（输入框留空不会清除；要更换请重新粘贴并保存）
+                    </p>
+                  )}
                   <button
                     type="button"
                     onClick={() => setShowApiKey((v) => !v)}
@@ -765,8 +787,16 @@ export function SettingsView() {
               打开 Wiki 整理医生
             </Button>
           </div>
+        </div>
+      </div>
+      </div>
 
-          <Button onClick={handleSave} className="w-full">
+      <div className="shrink-0 border-t bg-background/95 px-8 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+        <div className="mx-auto flex max-w-xl items-center gap-3">
+          {saved && (
+            <span className="text-sm text-emerald-600 dark:text-emerald-400">{t("settings.saved")}</span>
+          )}
+          <Button onClick={handleSave} className="ml-auto min-w-[140px]">
             {saved ? t("settings.saved") : t("settings.save")}
           </Button>
         </div>

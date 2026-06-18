@@ -11,6 +11,11 @@ export interface StreamCallbacks {
   onError: (error: Error) => void
 }
 
+export interface StreamChatOptions {
+  /** Override provider max output tokens (OpenAI-compatible max_tokens / Anthropic max_tokens) */
+  maxTokens?: number
+}
+
 const DECODER = new TextDecoder()
 const NATIVE_HTTP_TIMEOUT_MS = 15 * 60 * 1000
 
@@ -109,9 +114,16 @@ export async function streamChat(
   messages: import("./llm-providers").ChatMessage[],
   callbacks: StreamCallbacks,
   signal?: AbortSignal,
+  options?: StreamChatOptions,
 ): Promise<void> {
   const providerConfig = getProviderConfig(config)
-  const requestBody = providerConfig.buildBody(messages)
+  const requestBody =
+    options?.maxTokens && typeof providerConfig.buildBody === "function"
+      ? {
+          ...(providerConfig.buildBody(messages) as Record<string, unknown>),
+          max_tokens: options.maxTokens,
+        }
+      : providerConfig.buildBody(messages)
 
   const reqId = Math.random().toString(36).slice(2, 8)
   const totalChars = messages.reduce((acc, m) => acc + m.content.length, 0)

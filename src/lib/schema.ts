@@ -196,6 +196,136 @@ export function nowLocalTimestamp(): string {
   )
 }
 
+function parseLocalTimestampParts(value: unknown): { date: string; time: string | null } | null {
+  const match = String(value ?? "").match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/)
+  if (!match) return null
+  return {
+    date: match[1],
+    time: match[2] ? (match[2].length === 5 ? `${match[2]}:00` : match[2]) : null,
+  }
+}
+
+function formatTimestampFromDate(date: Date): string {
+  const pad = (n: number) => n.toString().padStart(2, "0")
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/** Coerce ISO / date-only / YAML Date values to YYYY-MM-DD HH:mm:ss */
+export function normalizeWikiTimestamp(value: unknown, fallback?: string): string {
+  const fb = fallback ?? nowLocalTimestamp()
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return formatTimestampFromDate(value)
+  }
+
+  const text = String(value ?? "").trim().replace(/^['"]|['"]$/g, "")
+  if (!text) return fb
+  if (TIMESTAMP_REGEX.test(text)) return text
+
+  const parts = parseLocalTimestampParts(text)
+  if (parts) {
+    return `${parts.date} ${parts.time ?? "00:00:00"}`
+  }
+
+  const parsedMs = Date.parse(text)
+  if (Number.isFinite(parsedMs)) {
+    return formatTimestampFromDate(new Date(parsedMs))
+  }
+
+  return fb
+}
+
+export function normalizeFrontmatterFields(
+  fm: Partial<WikiFrontmatter>,
+  options: { now?: string } = {},
+): Partial<WikiFrontmatter> {
+  const fallback = options.now ?? nowLocalTimestamp()
+  const next = { ...fm }
+  for (const field of ["created", "updated", "last_reviewed"] as const) {
+    next[field] = normalizeWikiTimestamp(next[field], fallback)
+  }
+  return next
+}
+
+export function pathToTitle(relativePath: string): string {
+  const base = relativePath.replace(/^wiki\//, "").replace(/\.md$/, "")
+  const last = base.split("/").pop() ?? base
+  return last.replace(/-/g, " ")
+}
+
+function buildFallbackSummary(title: string, body: string): string {
+  const paragraph = body
+    .split(/\n\n+/)
+    .map((chunk) => chunk.trim())
+    .find((chunk) => chunk && !chunk.startsWith("#") && !chunk.startsWith("```") && !chunk.startsWith("---"))
+  let summary = paragraph?.replace(/\s+/g, " ").slice(0, SUMMARY_MAX) ?? ""
+  if ([...summary].length < SUMMARY_MIN) {
+    summary = `${title}页面，由 ingest 基于 raw 资料自动整理生成，后续可继续补充证据链与交叉引用。`
+  }
+  while ([...summary].length < SUMMARY_MIN) summary += "。"
+  return [...summary].slice(0, SUMMARY_MAX).join("")
+}
+
+function clampSummaryLength(summary: string, title: string, body: string): string {
+  let s = summary.trim()
+  if (!s) return buildFallbackSummary(title, body)
+  if ([...s].length > SUMMARY_MAX) {
+    s = [...s].slice(0, SUMMARY_MAX).join("")
+  }
+  if ([...s].length < SUMMARY_MIN) {
+    return buildFallbackSummary(title, body)
+  }
+  return s
+}
+
+function sanitizeRelatedField(related: unknown): string[] {
+  if (!Array.isArray(related)) return []
+  return related.filter((item): item is string => typeof item === "string" && WIKILINK_REGEX.test(item))
+}
+
+/** Fill missing / invalid frontmatter fields before schema validation */
+export function coerceWikiPageFrontmatter(
+  fm: Partial<WikiFrontmatter>,
+  relativePath: string,
+  body: string,
+  options: { now?: string } = {},
+): Partial<WikiFrontmatter> {
+  const next = normalizeFrontmatterFields({ ...fm }, options) as Partial<WikiFrontmatter>
+
+  if (next.schema_version !== SCHEMA_VERSION) next.schema_version = SCHEMA_VERSION
+
+  if (!next.title || typeof next.title !== "string" || !next.title.trim()) {
+    const heading = body.match(/^#\s+(.+)$/m)?.[1]?.trim()
+    next.title = heading || pathToTitle(relativePath)
+  }
+
+  next.type = normalizeTypeAlias(String(next.type ?? "")) ?? inferTypeFromPath(relativePath)
+
+  next.summary = clampSummaryLength(
+    typeof next.summary === "string" ? next.summary : "",
+    next.title,
+    body,
+  )
+
+  if (!next.confidence || !CONFIDENCE.includes(next.confidence as Confidence)) {
+    next.confidence = "中"
+  }
+  next.status = normalizeStatusAlias(String(next.status ?? "")) ?? "活跃"
+
+  for (const field of ["aliases", "tags", "sources"] as const) {
+    const value = next[field]
+    if (value == null) next[field] = []
+    else if (!Array.isArray(value)) next[field] = [String(value)]
+  }
+
+  next.related = sanitizeRelatedField(next.related)
+
+  if (Array.isArray(next.sources)) {
+    next.sources = cleanSources(next.sources)
+  }
+
+  return next
+}
+
 // -----------------------------------------------------------------------------
 // Sources cleaning (§3.2)
 // -----------------------------------------------------------------------------

@@ -9,12 +9,14 @@ interface WelcomeScreenProps {
   onCreateProject: () => void
   onOpenProject: () => void
   onSelectProject: (project: WikiProject) => void
+  openingProjectPath?: string | null
 }
 
 export function WelcomeScreen({
   onCreateProject,
   onOpenProject,
   onSelectProject,
+  openingProjectPath = null,
 }: WelcomeScreenProps) {
   const { t } = useTranslation()
   const [recentProjects, setRecentProjects] = useState<WikiProject[]>([])
@@ -79,16 +81,19 @@ export function WelcomeScreen({
               {t("welcome.recentProjects")}
             </div>
             <div className="rounded-lg border">
-              {recentProjects.map((proj) => (
+              {recentProjects.map((proj) => {
+                const isOpening = openingProjectPath === proj.path
+                return (
                 <button
                   key={proj.path}
                   onClick={() => onSelectProject(proj)}
-                  className="group flex w-full items-center justify-between border-b px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-accent"
+                  disabled={!!openingProjectPath}
+                  className="group flex w-full items-center justify-between border-b px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-accent disabled:cursor-wait disabled:opacity-70"
                 >
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-medium">{proj.name}</div>
                     <div className="truncate text-xs text-muted-foreground">
-                      {proj.path}
+                      {isOpening ? "正在打开…" : proj.path}
                     </div>
                   </div>
                   <div
@@ -103,7 +108,8 @@ export function WelcomeScreen({
                     <X className="h-3.5 w-3.5 text-muted-foreground" />
                   </div>
                 </button>
-              ))}
+                )
+              })}
             </div>
           </div>
         )}

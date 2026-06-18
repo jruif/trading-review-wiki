@@ -131,6 +131,176 @@ fn load_or_create_pairing_code() -> String {
     code
 }
 
+fn clip_state_path() -> PathBuf {
+    clip_config_dir().join("clip-state.json")
+}
+
+fn app_state_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join("Library/Application Support/com.tradingreviewwiki.app/app-state.json");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("com.tradingreviewwiki.app/app-state.json");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".local/share/com.tradingreviewwiki.app/app-state.json");
+        }
+    }
+    PathBuf::from("app-state.json")
+}
+
+fn apply_clip_projects(current: &str, projects: &[(String, String)]) {
+    if !current.is_empty() {
+        if let Ok(mut guard) = CURRENT_PROJECT.lock() {
+            *guard = current.to_string();
+        }
+    }
+    if !projects.is_empty() {
+        if let Ok(mut guard) = ALL_PROJECTS.lock() {
+            *guard = projects.to_vec();
+        }
+    }
+    let root_paths: Vec<String> = projects.iter().map(|(_, path)| path.clone()).collect();
+    path_guard::sync_project_roots(&root_paths);
+}
+
+fn load_projects_from_app_state() {
+    let path = app_state_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+
+    let mut projects: Vec<(String, String)> = Vec::new();
+    if let Some(arr) = parsed["recentProjects"].as_array() {
+        for item in arr {
+            let name = item["name"].as_str().unwrap_or("").to_string();
+            let path = item["path"].as_str().unwrap_or("").to_string();
+            if !path.is_empty() {
+                projects.push((name, path));
+            }
+        }
+    }
+
+    let current = parsed["lastProject"]["path"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if projects.is_empty() && current.is_empty() {
+        return;
+    }
+
+    apply_clip_projects(&current, &projects);
+}
+
+/// Called when the desktop app opens or creates a wiki project.
+pub fn register_opened_project(name: &str, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+
+    if let Ok(mut guard) = CURRENT_PROJECT.lock() {
+        *guard = path.to_string();
+    }
+    if let Ok(mut guard) = ALL_PROJECTS.lock() {
+        guard.retain(|(_, existing)| existing != path);
+        guard.insert(0, (name.to_string(), path.to_string()));
+        guard.truncate(10);
+    }
+
+    path_guard::sync_project_roots(&[path.to_string()]);
+    save_clip_state();
+}
+
+fn clip_projects_empty() -> bool {
+    ALL_PROJECTS
+        .lock()
+        .map(|guard| guard.is_empty())
+        .unwrap_or(true)
+}
+
+fn ensure_clip_projects_loaded() {
+    if !clip_projects_empty() {
+        return;
+    }
+    load_projects_from_app_state();
+    if clip_projects_empty() {
+        load_clip_state();
+    }
+}
+
+fn load_clip_state() {
+    let path = clip_state_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+
+    let current = parsed["current"].as_str().unwrap_or("").to_string();
+
+    let mut projects: Vec<(String, String)> = Vec::new();
+    if let Some(arr) = parsed["projects"].as_array() {
+        for item in arr {
+            let name = item["name"].as_str().unwrap_or("").to_string();
+            let path = item["path"].as_str().unwrap_or("").to_string();
+            if !path.is_empty() {
+                projects.push((name, path));
+            }
+        }
+    }
+
+    if current.is_empty() && projects.is_empty() {
+        return;
+    }
+
+    apply_clip_projects(&current, &projects);
+}
+
+fn save_clip_state() {
+    let (current, projects) = {
+        let current = CURRENT_PROJECT.lock().map(|g| g.clone()).unwrap_or_default();
+        let projects = ALL_PROJECTS
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .map(|(name, path)| {
+                        format!(
+                            r#"{{"name":"{}","path":"{}"}}"#,
+                            name.replace('"', r#"\""#),
+                            path.replace('"', r#"\""#)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (current, projects)
+    };
+
+    let body = format!(
+        r#"{{"current":"{}","projects":[{}]}}"#,
+        current.replace('"', r#"\""#),
+        projects.join(",")
+    );
+    let dir = clip_config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(clip_state_path(), body);
+}
+
 fn set_clip_server_token(token: String) {
     if let Ok(mut guard) = CLIP_TOKEN.lock() {
         *guard = token;
@@ -261,9 +431,13 @@ pub fn start_clip_server() {
     set_pairing_code(load_or_create_pairing_code());
     set_clip_server_token(generate_token());
     set_extension_token(generate_token());
+    load_clip_state();
+    if clip_projects_empty() {
+        load_projects_from_app_state();
+    }
 
     thread::spawn(|| {
-        let mut restart_count: u32 = 0;
+        let mut restart_count: u32;
 
         loop {
             // Try to bind the port with retries
@@ -307,6 +481,7 @@ pub fn start_clip_server() {
 
         for mut request in server.incoming_requests() {
             let cors_headers = vec![
+                safe_header("Access-Control-Allow-Origin", "*"),
                 safe_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
                 safe_header(
                     "Access-Control-Allow-Headers",
@@ -378,6 +553,7 @@ pub fn start_clip_server() {
                         let _ = request.respond(response);
                         continue;
                     }
+                    ensure_clip_projects_loaded();
                     let path = match CURRENT_PROJECT.lock() {
                         Ok(guard) => guard.clone(),
                         Err(_) => {
@@ -426,6 +602,7 @@ pub fn start_clip_server() {
                         let _ = request.respond(response);
                         continue;
                     }
+                    ensure_clip_projects_loaded();
                     let projects = match ALL_PROJECTS.lock() {
                         Ok(guard) => guard.clone(),
                         Err(_) => {
@@ -479,6 +656,7 @@ pub fn start_clip_server() {
                             }
                         }
                     }
+                    save_clip_state();
                     let mut response = Response::from_string(r#"{"ok":true}"#);
                     for h in &cors_headers { response.add_header(h.clone()); }
                     let _ = request.respond(response);
@@ -581,12 +759,18 @@ fn handle_set_project(body: &str) -> String {
         return r#"{"ok":false,"error":"path is not a registered project"}"#.to_string();
     }
 
-    match CURRENT_PROJECT.lock() {
+    let updated = match CURRENT_PROJECT.lock() {
         Ok(mut guard) => {
             *guard = path;
-            r#"{"ok":true}"#.to_string()
+            true
         }
-        Err(_) => r#"{"ok":false,"error":"Lock error"}"#.to_string(),
+        Err(_) => false,
+    };
+    if updated {
+        save_clip_state();
+        r#"{"ok":true}"#.to_string()
+    } else {
+        r#"{"ok":false,"error":"Lock error"}"#.to_string()
     }
 }
 

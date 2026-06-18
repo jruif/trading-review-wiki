@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path"
 import {
-  DEFAULT_PROJECT_PATH,
   askWiki,
   apiRunIngest,
   applyManifest,
@@ -10,6 +9,7 @@ import {
   getBrainStatus,
   marketValidatePrediction,
   prepareIngest,
+  PROJECT_PATH_ENV_VARS,
   rememberBrainMemory,
   resolveBrainMemory,
   runAskEval,
@@ -41,13 +41,15 @@ function printHelp() {
   npm run codex:ingest -- temporal-facts audit [--project <wiki-root>] [--top-n 50] [--write]
 
 Defaults:
-  --project ${DEFAULT_PROJECT_PATH}
+  --project from ${PROJECT_PATH_ENV_VARS.join(" or ")} (required if --project omitted)
 
 Notes:
   prepare writes only .llm-wiki/codex-ingest reports.
   api-run writes staged artifacts (analysis.md, plan.json, files/**, changes.json) and dry-runs the manifest.
   finalize resumes after page FILE blocks exist and only regenerates housekeeping/changes.json/dry-run.
   --provider codex uses the local Codex CLI login instead of OPENAI_API_KEY.
+  --provider openai uses OpenAI Responses API by default, or Chat Completions when --endpoint targets DeepSeek/OpenRouter/local servers (or pass --api-mode chat|responses|auto).
+  --endpoint https://api.deepseek.com with --model deepseek-v4-pro uses DeepSeek Chat Completions; DEEPSEEK_API_KEY or OPENAI_API_KEY both work.
   --page-concurrency controls parallel FILE-block generation; defaults to 1.
   --max-plan-items, --max-create-pages, and --max-update-pages record soft plan-budget warnings in plan-budget.json; they do not stop normal ingest.
   ask is read-only. Use --show-context to print retrieval hits; use --show-sources to print source routing/native query summaries.
@@ -61,6 +63,7 @@ Notes:
   hygiene audit/plan are read-only; hygiene apply only removes old successful .llm-wiki/codex-ingest report dirs with --write.
   temporal-facts audit scans wiki/**/*.md and writes only .llm-wiki/temporal-facts when --write is present.
   apply is dry-run unless --write is present.
+  apply --skip-invalid skips wiki pages with fatal schema issues and writes the rest.
   raw/ is never written by this CLI.
 `)
 }
@@ -74,7 +77,7 @@ function parseArgs(argv) {
       continue
     }
     const key = token.slice(2)
-    if (["write", "no-report", "allow-source-change", "help", "show-context", "show-sources", "include-invalidated", "validate-pending-only", "deep"].includes(key)) {
+    if (["write", "no-report", "allow-source-change", "help", "show-context", "show-sources", "include-invalidated", "validate-pending-only", "deep", "skip-invalid"].includes(key)) {
       args[key] = true
       continue
     }
@@ -125,6 +128,7 @@ async function main() {
       model: provider === "openai" ? requireArg(args, "model") : args.model,
       apiKey: args["api-key"],
       endpoint: args.endpoint,
+      apiMode: args["api-mode"],
       reasoningEffort: args["reasoning-effort"],
       codexBin: args["codex-bin"],
       codexProfile: args["codex-profile"],
@@ -153,6 +157,7 @@ async function main() {
       model: provider === "openai" ? requireArg(args, "model") : args.model,
       apiKey: args["api-key"],
       endpoint: args.endpoint,
+      apiMode: args["api-mode"],
       reasoningEffort: args["reasoning-effort"],
       codexBin: args["codex-bin"],
       codexProfile: args["codex-profile"],
@@ -172,10 +177,17 @@ async function main() {
       projectPath: args.project,
       write: Boolean(args.write),
       allowSourceChange: Boolean(args["allow-source-change"]),
+      skipInvalid: Boolean(args["skip-invalid"]),
     })
     console.log(result.dryRun ? "Dry-run complete." : "Write complete.")
     console.log(`Report: ${result.reportPath}`)
-    console.log(`Files ${result.dryRun ? "planned" : "written"}: ${result.diffs.map((d) => d.path).join(", ") || "(none)"}`)
+    console.log(`Files ${result.dryRun ? "planned" : "written"}: ${result.diffs.filter((d) => d.changed !== false).map((d) => d.path).join(", ") || "(none)"}`)
+    if (result.skipped?.length) {
+      console.log(`Skipped invalid pages: ${result.skipped.length}`)
+      for (const item of result.skipped.slice(0, 10)) {
+        console.log(`- ${item.path}: ${item.issues.map((issue) => `[${issue.field}] ${issue.message}`).join("; ")}`)
+      }
+    }
     if (result.fatalIssues.length > 0) {
       console.log(`Fatal schema issues: ${result.fatalIssues.length}`)
       for (const issue of result.fatalIssues.slice(0, 10)) {
@@ -345,6 +357,9 @@ async function main() {
       projectPath: args.project,
       provider: args.provider ?? "codex",
       model: args.model,
+      apiKey: args["api-key"],
+      endpoint: args.endpoint,
+      apiMode: args["api-mode"],
       reasoningEffort: args["reasoning-effort"],
       codexBin: args["codex-bin"],
       codexProfile: args["codex-profile"],
@@ -434,6 +449,7 @@ async function main() {
       model: args.model,
       apiKey: args["api-key"],
       endpoint: args.endpoint,
+      apiMode: args["api-mode"],
       reasoningEffort: args["reasoning-effort"],
       codexBin: args["codex-bin"],
       codexProfile: args["codex-profile"],

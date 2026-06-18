@@ -121,6 +121,12 @@ npm run codex:ingest -- apply \
   --manifest /path/to/my-wiki-project/.llm-wiki/codex-ingest/<run-id>/changes.json \
   --project /path/to/my-wiki-project \
   --write
+
+# 若个别页面 schema 不合法（如股票页缺 code），可跳过非法页只写合法页：
+npm run codex:ingest -- apply \
+  --manifest /path/to/my-wiki-project/.llm-wiki/codex-ingest/<run-id>/changes.json \
+  --project /path/to/my-wiki-project \
+  --write --skip-invalid
 ```
 
 从 0 建库时的节奏：
@@ -689,6 +695,9 @@ flowchart TD
 | 外部软件跑命令找不到项目 | `--project` 没传或 cwd 不对 | 显式传 `--project /path/to/wiki-project` |
 | 机器解析 `ask` 很困难 | 普通 `ask` 输出 Markdown | 改用 `--show-sources` 或 `--show-context` |
 | 摄入后没写入 wiki | 没跑 `apply --write` | 先审阅 `changes.json`，再执行 `apply --write` |
+| apply 因个别页面 schema 失败 | LLM 生成页缺必填字段（如股票 `code`） | 用 `apply --write --skip-invalid` 跳过问题页；或修正 manifest 后重跑 |
+| JSON 解析报 control character | 源 Markdown 含不可打印控制字节 | 新版 CLI 读源时会清洗；重跑 `api-run`/`ingest` |
+| 时间戳 `2026-04-15` 被拒 | 旧 manifest 只有日期无时分秒 | 新版 `apply` 写入前自动规范为 `2026-04-15 00:00:00` |
 | SQL 不可用 | 本机私有配置没注入到子进程环境 | 调用方继承环境变量，或在调度器里显式设置本地配置路径 |
 | 旧事实影响答案 | 问审计问题却没指定开关 | 用 `--include-invalidated` 看历史反证 |
 | 自动化误删内容 | 直接操作 wiki/raw | 外部软件不要自己改 wiki/raw，交给 CLI 的 manifest/apply |

@@ -1,10 +1,12 @@
 import { useWikiStore } from "@/stores/wiki-store"
 import { autoIngest } from "./ingest"
 import { listDirectory, getClipServerToken } from "@/commands/fs"
+import { syncClipServerProjects } from "@/lib/clip-sync"
 
 const POLL_INTERVAL = 3000 // Check every 3 seconds
 let intervalId: ReturnType<typeof setInterval> | null = null
 let isPolling = false
+let didInitialSync = false
 
 /**
  * Start polling the clip server for new web clips.
@@ -17,6 +19,15 @@ export function startClipWatcher() {
     if (isPolling) return
     isPolling = true
     try {
+      const store = useWikiStore.getState()
+      const project = store.project
+      if (!didInitialSync && project) {
+        didInitialSync = true
+        syncClipServerProjects(project).catch((err) =>
+          console.warn("[ClipWatcher] Initial clip sync failed:", err)
+        )
+      }
+
       const token = await getClipServerToken()
       const res = await fetch("http://127.0.0.1:19827/clips/pending", {
         method: "GET",
@@ -25,9 +36,6 @@ export function startClipWatcher() {
       const data = await res.json()
 
       if (!data.ok || !data.clips || data.clips.length === 0) return
-
-      const store = useWikiStore.getState()
-      const project = store.project
 
       for (const clip of data.clips) {
         const clipProjectPath: string = clip.projectPath
@@ -65,4 +73,5 @@ export function stopClipWatcher() {
     clearInterval(intervalId)
     intervalId = null
   }
+  didInitialSync = false
 }

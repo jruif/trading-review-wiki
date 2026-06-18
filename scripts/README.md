@@ -46,7 +46,8 @@ cd trading-review-wiki/scripts
 ### 2. 预览（强烈建议先预览）
 
 ```bash
-node reorganize-wiki.cjs "C:/Users/你的用户名/Documents/你的项目/wiki" --dry-run
+# <wiki-root> 为项目下的 wiki/ 目录绝对或相对路径
+node reorganize-wiki.cjs ./wiki --dry-run
 ```
 
 `--dry-run` 只显示将要执行的操作，**不会实际移动任何文件**。
@@ -54,7 +55,7 @@ node reorganize-wiki.cjs "C:/Users/你的用户名/Documents/你的项目/wiki" 
 ### 3. 正式执行
 
 ```bash
-node reorganize-wiki.cjs "C:/Users/你的用户名/Documents/你的项目/wiki"
+node reorganize-wiki.cjs ./wiki
 ```
 
 ---
@@ -63,9 +64,9 @@ node reorganize-wiki.cjs "C:/Users/你的用户名/Documents/你的项目/wiki"
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
-| `<wiki路径>` | 必填，你的 wiki 文件夹路径 | `"C:/Users/xxx/wiki"` |
+| `<wiki-root>` | 必填，`wiki/` 目录路径 | `./wiki` |
 | `--dry-run` | 预览模式，只显示不执行 | `--dry-run` |
-| `--map <type>=<dir>` | 自定义 type→目录映射（可多次使用） | `--map 研报=策略` |
+| `--map <type>=<dir>` | 自定义 type→目录映射（可多次使用） | `--map entity=概念` |
 | `--help` | 显示帮助信息 | `--help` |
 
 ---
@@ -73,14 +74,20 @@ node reorganize-wiki.cjs "C:/Users/你的用户名/Documents/你的项目/wiki"
 ## 完整示例
 
 ```bash
-# 基本用法
-node reorganize-wiki.cjs "C:/Users/Administrator/Documents/杰杰杰/wiki"
+# 基本用法（在项目根目录执行）
+node reorganize-wiki.cjs ./wiki
 
-# 预览模式（安全测试）
-node reorganize-wiki.cjs "C:/Users/Administrator/Documents/杰杰杰/wiki" --dry-run
+# 预览模式
+node reorganize-wiki.cjs ./wiki --dry-run
 
-# 添加自定义映射
-node reorganize-wiki.cjs "./wiki" --map 研报=策略 --map 个股笔记=股票
+# 指定 wiki 根目录（绝对路径）
+node reorganize-wiki.cjs /path/to/project/wiki
+
+# 通过环境变量传入项目根，再拼 wiki 子目录
+node reorganize-wiki.cjs "$TRADING_WIKI_PROJECT/wiki"
+
+# 扩展 type → 目录映射
+node reorganize-wiki.cjs ./wiki --map entity=概念 --map report=sources
 
 # 查看帮助
 node reorganize-wiki.cjs --help
@@ -136,7 +143,7 @@ node reorganize-wiki.cjs --help
 **Q: 有些文件提示"未知 type"怎么办？**
 > 使用 `--map` 参数临时添加映射：
 > ```bash
-> node reorganize-wiki.cjs "./wiki" --map 你的类型=目标目录
+> node reorganize-wiki.cjs ./wiki --map custom-type=目标目录
 > ```
 
 **Q: 可以用在其他 Wiki 项目上吗？**

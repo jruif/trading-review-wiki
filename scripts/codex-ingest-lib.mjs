@@ -11,7 +11,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml"
 
 const execFileAsync = promisify(execFile)
 
-export const DEFAULT_PROJECT_PATH = "/Users/jiegege/Desktop/杰杰杰"
+export const PROJECT_PATH_ENV_VARS = ["TRADING_WIKI_PROJECT", "GANGTISE_MEETING_CLUES_PROJECT"]
 export const REPORT_ROOT = ".llm-wiki/codex-ingest"
 export const COMPANY_RESEARCH_ROOT = ".llm-wiki/company-research"
 export const MANIFEST_SCHEMA = "codex-ingest-manifest-v1"
@@ -55,6 +55,177 @@ const SUMMARY_MIN = 50
 const SUMMARY_MAX = 160
 const STOCK_CODE_REGEX = /^(?:(?:SZ|SH|BJ)\d{6}|HK\d{5}|[A-Z]{1,5}(?:\.[A-Z])?)$/
 const TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+
+export function sanitizeTextControlCharacters(text) {
+  return String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
+}
+
+function parseLocalTimestampParts(value) {
+  const match = String(value ?? "").match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/)
+  if (!match) return null
+  return {
+    date: match[1],
+    time: match[2] ? (match[2].length === 5 ? `${match[2]}:00` : match[2]) : null,
+  }
+}
+
+function formatTimestampFromDate(date) {
+  const pad = (n) => n.toString().padStart(2, "0")
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+export function normalizeWikiTimestamp(value, fallback = nowLocalTimestamp()) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return formatTimestampFromDate(value)
+  }
+
+  const text = String(value ?? "").trim().replace(/^['"]|['"]$/g, "")
+  if (!text) return fallback
+  if (TIMESTAMP_REGEX.test(text)) return text
+
+  const parts = parseLocalTimestampParts(text)
+  if (parts) {
+    return `${parts.date} ${parts.time ?? "00:00:00"}`
+  }
+
+  const parsedMs = Date.parse(text)
+  if (Number.isFinite(parsedMs)) {
+    return formatTimestampFromDate(new Date(parsedMs))
+  }
+
+  return fallback
+}
+
+export function normalizeFrontmatterFields(fm, options = {}) {
+  const fallback = options.now ?? nowLocalTimestamp()
+  const next = { ...(fm ?? {}) }
+  for (const field of ["created", "updated", "last_reviewed"]) {
+    next[field] = normalizeWikiTimestamp(next[field], fallback)
+  }
+  return next
+}
+
+function buildFallbackSummary(title, body) {
+  const paragraph = String(body ?? "")
+    .split(/\n\n+/)
+    .map((chunk) => chunk.trim())
+    .find((chunk) => chunk && !chunk.startsWith("#") && !chunk.startsWith("```") && !chunk.startsWith("---"))
+  let summary = paragraph?.replace(/\s+/g, " ").slice(0, SUMMARY_MAX) ?? ""
+  if ([...summary].length < SUMMARY_MIN) {
+    summary = `${title}页面，由 ingest 基于 raw 资料自动整理生成，后续可继续补充证据链与交叉引用。`
+  }
+  while ([...summary].length < SUMMARY_MIN) summary += "。"
+  return summary.slice(0, SUMMARY_MAX)
+}
+
+export function coerceWikiPageFrontmatter(fm, relativePath, body, options = {}) {
+  const next = normalizeFrontmatterFields({ ...(fm ?? {}) }, options)
+
+  if (next.schema_version !== 1) next.schema_version = 1
+
+  if (!next.title || typeof next.title !== "string" || !next.title.trim()) {
+    const heading = String(body ?? "").match(/^#\s+(.+)$/m)?.[1]?.trim()
+    next.title = heading || pathToTitle(relativePath)
+  }
+
+  next.type = normalizeTypeAlias(next.type) ?? inferTypeFromPath(relativePath)
+
+  if (typeof next.summary !== "string" || next.summary.trim().length === 0) {
+    next.summary = buildFallbackSummary(next.title, body)
+  }
+
+  if (!CONFIDENCE.includes(next.confidence)) next.confidence = "中"
+  next.status = normalizeStatusAlias(next.status) ?? "活跃"
+
+  for (const field of ["aliases", "tags", "related", "sources"]) {
+    if (next[field] == null) next[field] = []
+    else if (!Array.isArray(next[field])) next[field] = [String(next[field])]
+  }
+
+  return next
+}
+
+export function normalizeWikiPageContent(content, options = {}) {
+  const relativePath = options.relativePath ?? ""
+  const { fm, body } = parseFrontmatter(content)
+  const shouldCoerce = relativePath.startsWith("wiki/") && relativePath.endsWith(".md") && !isReservedWikiPath(relativePath)
+  const normalizedFm = shouldCoerce
+    ? coerceWikiPageFrontmatter(fm, relativePath, body, options)
+    : normalizeFrontmatterFields(fm, options)
+  const serialized = serializeFrontmatter(normalizedFm, body)
+  return serialized
+}
+
+function extractJsonFromModelText(text) {
+  const source = String(text ?? "")
+  const fencedJson = source.match(/```json\s*\n([\s\S]*?)```/i)
+  const rawJson = fencedJson?.[1] ?? source.slice(source.indexOf("{"), source.lastIndexOf("}") + 1)
+  if (!rawJson.trim()) throw new Error("Model output did not contain a JSON object")
+  return rawJson
+}
+
+function escapeControlCharactersInJsonStrings(raw) {
+  let out = ""
+  let inString = false
+  let escaped = false
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (!inString) {
+      out += ch
+      if (ch === '"') inString = true
+      continue
+    }
+    if (escaped) {
+      out += ch
+      escaped = false
+      continue
+    }
+    if (ch === "\\") {
+      out += ch
+      escaped = true
+      continue
+    }
+    if (ch === '"') {
+      out += ch
+      inString = false
+      continue
+    }
+    const code = ch.charCodeAt(0)
+    if (code < 0x20) {
+      if (ch === "\n") out += "\\n"
+      else if (ch === "\r") out += "\\r"
+      else if (ch === "\t") out += "\\t"
+      continue
+    }
+    if (code === 0x7f || (code >= 0x80 && code <= 0x9f)) continue
+    out += ch
+  }
+
+  return out
+}
+
+export function parseModelJson(text) {
+  const rawJson = extractJsonFromModelText(text)
+  const attempts = [
+    () => JSON.parse(rawJson),
+    () => JSON.parse(rawJson.replace(/^\uFEFF/, "")),
+    () => JSON.parse(escapeControlCharactersInJsonStrings(rawJson)),
+    () => JSON.parse(escapeControlCharactersInJsonStrings(rawJson.replace(/[\u201C\u201D]/g, '"'))),
+  ]
+
+  let lastError = null
+  for (const attempt of attempts) {
+    try {
+      return attempt()
+    } catch (err) {
+      lastError = err
+    }
+  }
+  throw lastError ?? new Error("Model output did not contain valid JSON")
+}
 const WIKILINK_REGEX = /^\[\[[^\]]+\]\]$/
 const RESERVED_WIKI_PATHS = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
 const DAILY_LOG_REGEX = /^wiki\/logs\/log-\d{4}-\d{2}-\d{2}\.md$/
@@ -622,6 +793,24 @@ export function toPosixPath(input) {
 
 export function normalizePath(input) {
   return toPosixPath(path.resolve(input))
+}
+
+export function resolveProjectPathFromEnv(env = process.env) {
+  const candidate =
+    env.TRADING_WIKI_PROJECT?.trim() ||
+    env.GANGTISE_MEETING_CLUES_PROJECT?.trim()
+  return candidate ? normalizePath(candidate) : null
+}
+
+export function resolveProjectPath(options = {}, env = process.env) {
+  const explicit = typeof options === "string" ? options : options.projectPath
+  const candidate = String(explicit ?? "").trim() || resolveProjectPathFromEnv(env)
+  if (!candidate) {
+    throw new Error(
+      `Missing wiki project path. Pass --project <path>, or set ${PROJECT_PATH_ENV_VARS.join(" / ")}.`,
+    )
+  }
+  return normalizePath(candidate)
 }
 
 export function projectRelative(projectPath, targetPath) {
@@ -2207,7 +2396,7 @@ function buildTemporalFactsAuditMarkdown(result, topN = 50) {
 }
 
 export async function runTemporalFactsAudit(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const topN = parsePositiveInteger(options.topN ?? options.top, 50)
   const generatedAt = nowLocalTimestamp()
   const pages = await collectTemporalAuditWikiPages(projectPath, options)
@@ -2499,7 +2688,7 @@ export async function runHygiene(options = {}) {
   if (!["audit", "plan", "apply"].includes(action)) {
     throw new Error("Unknown hygiene action. Use audit, plan, or apply.")
   }
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const keepDays = parsePositiveInteger(options.keepDays, 14)
   const audit = await buildHygieneAudit(projectPath, keepDays)
   const plan = action === "audit" ? { actions: [], notes: [] } : await buildHygienePlan(projectPath, keepDays)
@@ -2591,39 +2780,42 @@ export function cleanSources(raw) {
   return out
 }
 
-export function validateFrontmatter(fm, filePath = "") {
+export function validateFrontmatter(fm, filePath = "", body = "") {
+  const coerced = filePath
+    ? coerceWikiPageFrontmatter(fm, filePath, body, {})
+    : normalizeFrontmatterFields(fm)
   const violations = []
   const add = (field, message, fatal = true) => violations.push({ field, message, fatal })
 
-  if (fm.schema_version !== 1) add("schema_version", "must be 1")
-  if (!fm.title || typeof fm.title !== "string") add("title", "missing title")
+  if (coerced.schema_version !== 1) add("schema_version", "must be 1")
+  if (!coerced.title || typeof coerced.title !== "string") add("title", "missing title")
 
-  const normalizedType = normalizeTypeAlias(fm.type)
+  const normalizedType = normalizeTypeAlias(coerced.type)
   if (!normalizedType) add("type", `must be one of: ${WIKI_TYPES.join(" / ")}`)
 
-  if (typeof fm.summary !== "string" || fm.summary.trim().length === 0) {
+  if (typeof coerced.summary !== "string" || coerced.summary.trim().length === 0) {
     add("summary", "missing summary")
   } else {
-    const len = [...fm.summary].length
+    const len = [...coerced.summary].length
     if (len < SUMMARY_MIN || len > SUMMARY_MAX) {
       add("summary", `summary should be ${SUMMARY_MIN}-${SUMMARY_MAX} characters`, false)
     }
   }
 
   for (const field of ["created", "updated", "last_reviewed"]) {
-    const value = fm[field]
+    const value = coerced[field]
     if (typeof value !== "string" || !TIMESTAMP_REGEX.test(value)) {
       add(field, "must use YYYY-MM-DD HH:mm:ss")
     }
   }
 
-  if (!CONFIDENCE.includes(fm.confidence)) add("confidence", `must be one of: ${CONFIDENCE.join(" / ")}`)
+  if (!CONFIDENCE.includes(coerced.confidence)) add("confidence", `must be one of: ${CONFIDENCE.join(" / ")}`)
 
-  const normalizedStatus = normalizeStatusAlias(fm.status)
+  const normalizedStatus = normalizeStatusAlias(coerced.status)
   if (!normalizedStatus) add("status", `must be one of: ${WIKI_STATUS.join(" / ")}`)
 
   if (normalizedType === "股票") {
-    if (typeof fm.code !== "string" || !STOCK_CODE_REGEX.test(fm.code)) {
+    if (typeof coerced.code !== "string" || !STOCK_CODE_REGEX.test(coerced.code)) {
       add("code", "stock pages require code like SZ000001, HK09992, or AAPL")
     }
   }
@@ -2634,13 +2826,13 @@ export function validateFrontmatter(fm, filePath = "") {
     ["related", true],
     ["sources", false],
   ]) {
-    if (fm[field] == null) continue
-    if (!Array.isArray(fm[field])) {
+    if (coerced[field] == null) continue
+    if (!Array.isArray(coerced[field])) {
       add(field, "must be an array")
       continue
     }
     if (expectedArray) {
-      for (const item of fm[field]) {
+      for (const item of coerced[field]) {
         if (typeof item !== "string" || !WIKILINK_REGEX.test(item)) {
           add(field, `invalid wikilink in ${field}: ${String(item)}`)
         }
@@ -2662,7 +2854,7 @@ export function validateWikiContent(relativePath, content) {
   if (isReservedWikiPath(relativePath)) return []
   if (!relativePath.startsWith("wiki/") || !relativePath.endsWith(".md")) return []
   const { fm, body } = parseFrontmatter(content)
-  const issues = validateFrontmatter(fm, relativePath)
+  const issues = validateFrontmatter(fm, relativePath, body)
   const bodyLineCount = countBodyLines(body)
   if (bodyLineCount > PAGE_BODY_LINE_SOFT_LIMIT) {
     issues.push({
@@ -4054,10 +4246,7 @@ export async function buildMethodologyContext(projectPath, options = {}) {
 }
 
 function parseJsonObjectFromModelText(text) {
-  const fencedJson = String(text ?? "").match(/```json\s*\n([\s\S]*?)```/i)
-  const rawJson = fencedJson?.[1] ?? String(text ?? "").slice(String(text ?? "").indexOf("{"), String(text ?? "").lastIndexOf("}") + 1)
-  if (!rawJson.trim()) throw new Error("Model output did not contain a JSON object")
-  return JSON.parse(rawJson)
+  return parseModelJson(text)
 }
 
 function parseAskSourcesOption(value) {
@@ -4437,15 +4626,6 @@ function sqlDateSortValue(value) {
   return Number.isFinite(parsed) ? parsed : String(value ?? "")
 }
 
-function parseLocalTimestampParts(value) {
-  const match = String(value ?? "").match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/)
-  if (!match) return null
-  return {
-    date: match[1],
-    time: match[2] ? (match[2].length === 5 ? `${match[2]}:00` : match[2]) : null,
-  }
-}
-
 function validationAnchorFromPrediction(prediction) {
   const parsed = parseLocalTimestampParts(prediction?.createdAt ?? prediction?.answeredAt ?? prediction?.date)
   if (!parsed?.date) return null
@@ -4664,7 +4844,7 @@ function buildBaseAskSources(projectPath, options = {}) {
 }
 
 export async function buildAskSourceRegistry(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const query = String(options.query ?? "")
   const sources = buildBaseAskSources(projectPath, options)
   const stockSource = sources.find((source) => source.id === "stock_daily_sql")
@@ -4795,7 +4975,7 @@ async function rankAskSourcesWithLlm({ query, sources, sourceK, options }) {
         prompt,
         instructions,
         model: options.model,
-        prepared: { projectPath: normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH) },
+        prepared: { projectPath: resolveProjectPath(options) },
         outputPath,
         codexBin: options.codexBin,
         codexProfile: options.codexProfile,
@@ -4806,12 +4986,13 @@ async function rankAskSourcesWithLlm({ query, sources, sourceK, options }) {
       await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
     }
   } else if (provider === "openai") {
-    const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY
+    const apiKey = resolveOpenAiApiKey(options)
     const model = options.model ?? process.env.OPENAI_MODEL
     if (!apiKey || !model) return { sourceIds: [], rationale: {}, warning: "OpenAI source routing skipped because api key/model is missing" }
-    text = await requestResponsesText({
+    text = await requestOpenAiProviderText({
       apiKey,
       endpoint: options.endpoint,
+      apiMode: options.apiMode,
       model,
       prompt,
       instructions,
@@ -5154,7 +5335,7 @@ function buildBrainRecord({ type, text, title, status, source, tags, related, me
 }
 
 export async function rememberBrainMemory(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const record = buildBrainRecord(options)
   const fileName = brainFileForType(record.type)
   const filePath = path.join(brainDir(projectPath), fileName)
@@ -5216,7 +5397,7 @@ async function searchAskBrain(projectPath, query, tokens, options = {}) {
 }
 
 export async function getBrainStatus(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const records = await readBrainRecords(projectPath)
   const byFile = {}
   const byType = {}
@@ -5231,7 +5412,7 @@ export async function getBrainStatus(options = {}) {
 }
 
 export async function resolveBrainMemory(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const targetId = String(options.id ?? options.targetId ?? "").trim()
   const result = normalizeBrainResult(options.result)
   if (!targetId) throw new Error("Missing brain memory id")
@@ -5404,7 +5585,7 @@ function buildSelfTrainingActionsFromRecords(records) {
 }
 
 export async function runSelfTraining(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const records = await readBrainRecords(projectPath)
   const actions = buildSelfTrainingActionsFromRecords(records)
   const dryRun = !options.write
@@ -5418,7 +5599,7 @@ export async function runSelfTraining(options = {}) {
 }
 
 export async function marketValidatePrediction(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const prediction = String(options.prediction ?? options.text ?? "").trim()
   const stock = String(options.stock ?? "").trim()
   if (!prediction) throw new Error("Missing --prediction")
@@ -6397,12 +6578,13 @@ async function requestDailyLoopQuestionsWithLlm({ mode, questionCount, themes, s
       await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
     }
   } else if ((options.provider ?? "") === "openai") {
-    const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY
+    const apiKey = resolveOpenAiApiKey(options)
     const model = options.model ?? process.env.OPENAI_MODEL
     if (!apiKey || !model) throw new Error("OpenAI daily-loop planner skipped because api key/model is missing")
-    text = await requestResponsesText({
+    text = await requestOpenAiProviderText({
       apiKey,
       endpoint: options.endpoint,
+      apiMode: options.apiMode,
       model,
       prompt,
       instructions,
@@ -6756,7 +6938,7 @@ function renderDailyLoopWikiFeedback({ mode, runId, questions, validations, self
 }
 
 export async function runDailyLoop(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const mode = parseDailyLoopMode(options.mode)
   const lookbackDays = parsePositiveInteger(options.lookbackDays, 30)
   const maxStocksPerQuestion = parsePositiveInteger(options.maxStocksPerQuestion, 8)
@@ -6984,7 +7166,7 @@ function sampleFromBrainRecord(record, kind) {
 }
 
 export async function exportTrainingSamples(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const kind = String(options.kind ?? "sft").trim().toLowerCase()
   if (!["sft", "preference", "eval"].includes(kind)) throw new Error("--kind must be sft, preference, or eval")
   const records = (await readBrainRecords(projectPath)).map((item) => item.value).filter((item) => item && typeof item === "object" && !Array.isArray(item))
@@ -7459,7 +7641,7 @@ function askInstructions() {
 export async function buildAskRetrievalContext(options = {}) {
   const query = String(options.query ?? "").trim()
   if (!query) throw new Error("Missing ask query")
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const sourceRouting = await selectAskSources({ ...options, query, projectPath })
   const selectedSourceIds = new Set(sourceRouting.selectedSources.map((source) => source.id))
   const retrieved = await searchAskCandidates(projectPath, query, options)
@@ -7578,13 +7760,14 @@ export async function askWiki(options = {}) {
   }
 
   if (provider === "openai") {
-    const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY
+    const apiKey = resolveOpenAiApiKey(options)
     const model = options.model ?? process.env.OPENAI_MODEL
-    if (!apiKey) throw new Error("Missing OpenAI API key. Pass --api-key or set OPENAI_API_KEY, or use --provider codex.")
+    if (!apiKey) throw new Error("Missing OpenAI-compatible API key. Pass --api-key or set OPENAI_API_KEY / DEEPSEEK_API_KEY, or use --provider codex.")
     if (!model) throw new Error("Missing model. Pass --model or set OPENAI_MODEL.")
-    const answer = await requestResponsesText({
+    const answer = await requestOpenAiProviderText({
       apiKey,
       endpoint: options.endpoint,
+      apiMode: options.apiMode,
       model,
       prompt: context.prompt,
       instructions: askInstructions(),
@@ -7714,7 +7897,7 @@ function normalizeAskEvalCases(options) {
 }
 
 export async function runAskEval(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const cases = []
   for (const [index, rawCase] of normalizeAskEvalCases(options).entries()) {
     const query = String(rawCase.query ?? "").trim()
@@ -11595,7 +11778,7 @@ function resolveCompanyFromInputs({ stockInput, tushareEvidence }) {
 }
 
 export async function runCompanyResearch(options = {}) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const stockInput = String(options.stock ?? options.company ?? "").trim()
   if (!stockInput) throw new Error("Missing --stock for company-research")
   const generatedAt = nowLocalTimestamp()
@@ -12016,13 +12199,13 @@ function buildDryRunMarkdown({ sourceRelativePath, sourceHash, reportDir, candid
 }
 
 export async function prepareIngest(options) {
-  const projectPath = normalizePath(options.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath(options)
   const sourcePath = normalizePath(options.sourcePath)
   if (!isTextSourcePath(sourcePath)) {
     throw new Error(`Unsupported source type for text ingest: ${sourcePath}`)
   }
 
-  const fullSourceContent = await readTextFile(sourcePath)
+  const fullSourceContent = sanitizeTextControlCharacters(await readTextFile(sourcePath))
   const sourceHash = shortHash(fullSourceContent)
   const sourceContent = compactSourceContentForPrompt(fullSourceContent, sourcePath, sourceHash)
   const sourceRelativePath = projectRelative(projectPath, sourcePath)
@@ -12179,10 +12362,8 @@ export function parseFileBlocks(text) {
 }
 
 export function parseManifestFromModelText(text, baseManifest) {
-  const fencedJson = text.match(/```json\s*\n([\s\S]*?)```/i)
-  const rawJson = fencedJson?.[1] ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)
   try {
-    const parsed = JSON.parse(rawJson)
+    const parsed = parseModelJson(text)
     if (parsed && Array.isArray(parsed.writes)) return { ...baseManifest, ...parsed }
   } catch {
     // Fall through to FILE block parsing.
@@ -12202,9 +12383,7 @@ export function parseManifestFromModelText(text, baseManifest) {
 }
 
 export function parsePlanFromModelText(text) {
-  const fencedJson = text.match(/```json\s*\n([\s\S]*?)```/i)
-  const rawJson = fencedJson?.[1] ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)
-  const parsed = JSON.parse(rawJson)
+  const parsed = parseModelJson(text)
   const create = Array.isArray(parsed?.create) ? parsed.create : []
   const update = Array.isArray(parsed?.update) ? parsed.update : []
   const factWrites = Array.isArray(parsed?.factWrites) ? parsed.factWrites : []
@@ -12865,15 +13044,25 @@ function buildSimpleDiff(before, after) {
   ].join("\n")
 }
 
+function prepareWikiWriteContent(relativePath, content, nowTs) {
+  if (!relativePath.startsWith("wiki/") || !relativePath.endsWith(".md")) {
+    return sanitizeTextControlCharacters(content)
+  }
+  if (isReservedWikiPath(relativePath)) return sanitizeTextControlCharacters(content)
+  return normalizeWikiPageContent(sanitizeTextControlCharacters(content), { now: nowTs, relativePath })
+}
+
 export async function applyManifest(options) {
   const manifestPath = normalizePath(options.manifestPath)
   const manifest = JSON.parse(await readTextFile(manifestPath))
-  const projectPath = normalizePath(options.projectPath ?? manifest.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath({ projectPath: options.projectPath ?? manifest.projectPath })
   const write = Boolean(options.write)
   const allowSourceChange = Boolean(options.allowSourceChange)
+  const skipInvalid = Boolean(options.skipInvalid)
+  const nowTs = manifest.createdAt ?? nowLocalTimestamp()
 
   if (manifest.sourcePath && manifest.sourceHash && !allowSourceChange) {
-    const currentSource = await readTextFile(manifest.sourcePath)
+    const currentSource = sanitizeTextControlCharacters(await readTextFile(manifest.sourcePath))
     const currentHash = shortHash(currentSource)
     if (currentHash !== manifest.sourceHash) {
       throw new Error(`Source hash changed: expected ${manifest.sourceHash}, got ${currentHash}`)
@@ -12917,15 +13106,17 @@ export async function applyManifest(options) {
   const validation = []
   const diffs = []
   const written = []
+  const skipped = []
   const factsWritten = []
   let factIndex = null
 
   for (const item of finalWrites) {
     const fullPath = path.join(projectPath, item.path)
     const existing = await readIfExists(fullPath)
+    const normalizedContent = prepareWikiWriteContent(item.path, item.content, nowTs)
     const after = item.action === "append" && existing
-      ? `${existing.replace(/\s*$/, "")}\n\n${item.content.trim()}\n`
-      : item.content
+      ? `${existing.replace(/\s*$/, "")}\n\n${normalizedContent.trim()}\n`
+      : normalizedContent
 
     const issues = [
       ...validateWikiContent(item.path, after),
@@ -12946,7 +13137,7 @@ export async function applyManifest(options) {
     item.issues.filter((issue) => issue.fatal).map((issue) => ({ path: item.path, ...issue })),
   )
   const fatalFactIssues = factValidation.filter((issue) => issue.fatal)
-  if ((fatalIssues.length > 0 || fatalFactIssues.length > 0) && write) {
+  if ((fatalIssues.length > 0 || fatalFactIssues.length > 0) && write && !skipInvalid) {
     const wikiMessages = fatalIssues.map((i) => `${i.path} [${i.field}] ${i.message}`)
     const factMessages = fatalFactIssues.map((i) => `${i.path} ${i.id ? `[${i.id}] ` : ""}[${i.field}] ${i.message}`)
     throw new Error(`Fatal schema validation failed:\n${[...wikiMessages, ...factMessages].join("\n")}`)
@@ -12954,11 +13145,19 @@ export async function applyManifest(options) {
 
   if (write) {
     for (const item of finalWrites) {
+      const itemFatal = validation
+        .find((entry) => entry.path === item.path)
+        ?.issues.filter((issue) => issue.fatal) ?? []
+      if (skipInvalid && itemFatal.length > 0) {
+        skipped.push({ path: item.path, issues: itemFatal })
+        continue
+      }
       const fullPath = path.join(projectPath, item.path)
       const existing = await readIfExists(fullPath)
+      const normalizedContent = prepareWikiWriteContent(item.path, item.content, nowTs)
       const after = item.action === "append" && existing
-        ? `${existing.replace(/\s*$/, "")}\n\n${item.content.trim()}\n`
-        : item.content
+        ? `${existing.replace(/\s*$/, "")}\n\n${normalizedContent.trim()}\n`
+        : normalizedContent
       await ensureDirectory(path.dirname(fullPath))
       await fs.writeFile(fullPath, after, "utf8")
       written.push(item.path)
@@ -12975,7 +13174,7 @@ export async function applyManifest(options) {
 
   let sourceHashAfter = null
   if (manifest.sourcePath) {
-    sourceHashAfter = shortHash(await readTextFile(manifest.sourcePath))
+    sourceHashAfter = shortHash(sanitizeTextControlCharacters(await readTextFile(manifest.sourcePath)))
   }
 
   const report = {
@@ -13005,6 +13204,7 @@ export async function applyManifest(options) {
     fatalFactIssues,
     factsWritten,
     factIndex,
+    skipped,
   }
 
   const reportPath = path.join(path.dirname(manifestPath), write ? "apply-report.json" : "apply-dry-run.json")
@@ -13034,6 +13234,97 @@ function buildResponsesBody({ model, prompt, instructions, reasoningEffort = "me
   }
 }
 
+const CHAT_COMPLETIONS_PATH = "/chat/completions"
+const RESPONSES_PATH = "/v1/responses"
+
+export function normalizeOpenAiEndpointBase(endpoint) {
+  let trimmed = String(endpoint ?? "https://api.openai.com").trim().replace(/\/$/, "")
+  trimmed = trimmed.replace(/\/v1\/responses$/i, "")
+  trimmed = trimmed.replace(/\/responses$/i, "")
+  trimmed = trimmed.replace(/\/v1\/chat\/completions$/i, "")
+  trimmed = trimmed.replace(/\/chat\/completions$/i, "")
+  trimmed = trimmed.replace(/\/v1$/i, "")
+  return trimmed
+}
+
+export function resolveOpenAiEndpoint(options = {}) {
+  return normalizeOpenAiEndpointBase(
+    options.endpoint ?? process.env.OPENAI_API_BASE ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com",
+  )
+}
+
+export function resolveOpenAiApiMode(options = {}) {
+  const requested = String(options.apiMode ?? process.env.OPENAI_API_MODE ?? "auto").trim().toLowerCase()
+  if (requested === "chat" || requested === "responses") return requested
+
+  const base = resolveOpenAiEndpoint(options).toLowerCase()
+  if (base.includes("/chat/completions")) return "chat"
+  if (base.includes("/responses")) return "responses"
+  if (base.includes("deepseek.com")) return "chat"
+  if (base.includes("moonshot.cn") || base.includes("api.moonshot")) return "chat"
+  if (base.includes("api.minimaxi.com")) return "chat"
+  if (base.includes("openrouter.ai")) return "chat"
+  if (base.includes("localhost") || base.includes("127.0.0.1")) return "chat"
+  if (!base || base.includes("api.openai.com")) return "responses"
+  return "chat"
+}
+
+export function buildOpenAiChatCompletionsUrl(endpoint) {
+  const base = normalizeOpenAiEndpointBase(endpoint)
+  return `${base}${CHAT_COMPLETIONS_PATH}`
+}
+
+export function buildOpenAiResponsesUrl(endpoint) {
+  const base = normalizeOpenAiEndpointBase(endpoint)
+  return `${base}${RESPONSES_PATH}`
+}
+
+function normalizeChatReasoningEffort(reasoningEffort) {
+  const raw = String(reasoningEffort ?? "").trim().toLowerCase()
+  if (!raw || raw === "none" || raw === "off") return null
+  if (raw === "xhigh") return "high"
+  if (["minimal", "low", "medium", "high"].includes(raw)) return raw
+  return "medium"
+}
+
+function shouldEnableDeepSeekThinking(model, reasoningEffort) {
+  const lower = String(model ?? "").toLowerCase()
+  if (lower.includes("reasoner")) return true
+  if (lower.includes("v4-pro")) return true
+  return reasoningEffort === "high"
+}
+
+export function buildChatCompletionsBody({ model, prompt, instructions, reasoningEffort = "medium", endpoint }) {
+  const systemContent =
+    instructions ??
+    [
+      "You are Codex implementing an application-grade text ingest for a trading review wiki.",
+      "Follow the stage-specific output format exactly.",
+    ].join("\n")
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: systemContent },
+      { role: "user", content: prompt },
+    ],
+    stream: false,
+  }
+  const effort = normalizeChatReasoningEffort(reasoningEffort)
+  if (effort) body.reasoning_effort = effort
+  if (resolveOpenAiEndpoint({ endpoint }).toLowerCase().includes("deepseek.com") && shouldEnableDeepSeekThinking(model, effort)) {
+    body.thinking = { type: "enabled" }
+  }
+  return body
+}
+
+export function resolveOpenAiApiKey(options = {}) {
+  if (options.apiKey) return options.apiKey
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY
+  const base = resolveOpenAiEndpoint(options).toLowerCase()
+  if (base.includes("deepseek.com") && process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY
+  return undefined
+}
+
 function extractTextFromResponsesJson(parsed) {
   if (typeof parsed?.output_text === "string" && parsed.output_text) return parsed.output_text
   const texts = []
@@ -13046,7 +13337,7 @@ function extractTextFromResponsesJson(parsed) {
   if (texts.length > 0) return texts.join("")
   const chatContent = parsed?.choices?.[0]?.message?.content
   if (typeof chatContent === "string" && chatContent) return chatContent
-  throw new Error("No assistant text found in Responses API output")
+  throw new Error("No assistant text found in provider output")
 }
 
 export function buildCodexExecInvocation({
@@ -13181,10 +13472,10 @@ async function requestCodexExecText({
 
 export async function apiRunIngest(options) {
   const provider = options.provider ?? "openai"
-  const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY
+  const apiKey = resolveOpenAiApiKey(options)
   const model = options.model ?? (provider === "openai" ? process.env.OPENAI_MODEL : process.env.CODEX_MODEL)
   if (!options.requestText && provider === "openai" && !apiKey) {
-    throw new Error("Missing OpenAI API key. Pass --api-key or set OPENAI_API_KEY, or use --provider codex.")
+    throw new Error("Missing OpenAI-compatible API key. Pass --api-key or set OPENAI_API_KEY / DEEPSEEK_API_KEY, or use --provider codex.")
   }
   if (!options.requestText && provider === "openai" && !model) {
     throw new Error("Missing model. Pass --model or set OPENAI_MODEL.")
@@ -13224,9 +13515,10 @@ export async function apiRunIngest(options) {
         codexTimeoutMs: options.codexTimeoutMs,
       })
     }
-    return requestResponsesText({
+    return requestOpenAiProviderText({
       apiKey,
       endpoint: options.endpoint,
+      apiMode: options.apiMode,
       model,
       prompt,
       instructions,
@@ -13289,7 +13581,14 @@ export async function apiRunIngest(options) {
     }
     const artifactName = `${String(i + 1).padStart(3, "0")}-${item.path.replace(/[^\p{L}\p{N}._-]+/gu, "_")}`
     await fs.writeFile(path.join(filesDir, artifactName), raw, "utf8")
-    return { action: item.action, path: item.path, content: block.content }
+    return {
+      action: item.action,
+      path: item.path,
+      content: normalizeWikiPageContent(sanitizeTextControlCharacters(block.content), {
+        now: nowTs,
+        relativePath: item.path,
+      }),
+    }
   })
 
   const housekeeping = buildProgrammaticHousekeepingWrites({
@@ -13326,15 +13625,15 @@ export async function finalizeStagedIngest(options) {
   const reportDir = normalizePath(options.reportDir)
   const manifestTemplatePath = path.join(reportDir, "changes.template.json")
   const manifestTemplate = JSON.parse(await fs.readFile(manifestTemplatePath, "utf8"))
-  const projectPath = normalizePath(options.projectPath ?? manifestTemplate.projectPath ?? DEFAULT_PROJECT_PATH)
+  const projectPath = resolveProjectPath({ projectPath: options.projectPath ?? manifestTemplate.projectPath })
   const sourcePath = normalizePath(manifestTemplate.sourcePath)
   const sourceBaseName = path.basename(sourcePath).replace(/\.[^.]+$/, "")
   const provider = options.provider ?? "codex"
-  const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY
+  const apiKey = resolveOpenAiApiKey(options)
   const model = options.model ?? (provider === "openai" ? process.env.OPENAI_MODEL : process.env.CODEX_MODEL)
 
   if (!["openai", "codex"].includes(provider)) throw new Error(`Unsupported provider: ${provider}`)
-  if (provider === "openai" && !apiKey) throw new Error("Missing OpenAI API key. Pass --api-key or set OPENAI_API_KEY, or use --provider codex.")
+  if (provider === "openai" && !apiKey) throw new Error("Missing OpenAI-compatible API key. Pass --api-key or set OPENAI_API_KEY / DEEPSEEK_API_KEY, or use --provider codex.")
   if (provider === "openai" && !model) throw new Error("Missing model. Pass --model or set OPENAI_MODEL.")
 
   const createdAt = manifestTemplate.createdAt ?? nowLocalTimestamp()
@@ -13379,7 +13678,14 @@ export async function finalizeStagedIngest(options) {
   const pageWrites = items.map((item) => {
     const block = blocksByPath.get(item.path)
     if (!block) throw new Error(`Missing generated FILE block for ${item.path}`)
-    return { action: item.action, path: item.path, content: block.content }
+    return {
+      action: item.action,
+      path: item.path,
+      content: normalizeWikiPageContent(sanitizeTextControlCharacters(block.content), {
+        now: prepared.createdAt,
+        relativePath: item.path,
+      }),
+    }
   })
 
   const housekeepingPath = path.join(filesDir, "999-housekeeping.md")
@@ -13411,6 +13717,29 @@ export async function finalizeStagedIngest(options) {
   return { reportDir, filesDir, plan, manifestPath, dryRunReport }
 }
 
+async function requestChatCompletionsText({ apiKey, endpoint, model, prompt, instructions, reasoningEffort }) {
+  const body = buildChatCompletionsBody({
+    model,
+    prompt,
+    instructions,
+    reasoningEffort,
+    endpoint,
+  })
+  const response = await fetch(buildOpenAiChatCompletionsUrl(endpoint), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    throw new Error(`Chat Completions API failed: HTTP ${response.status} ${await response.text()}`)
+  }
+  const parsed = await response.json()
+  return extractTextFromResponsesJson(parsed)
+}
+
 async function requestResponsesText({ apiKey, endpoint, model, prompt, instructions, reasoningEffort }) {
   const body = buildResponsesBody({
     model,
@@ -13419,8 +13748,7 @@ async function requestResponsesText({ apiKey, endpoint, model, prompt, instructi
     reasoningEffort,
   })
 
-  const responseEndpoint = `${(endpoint ?? "https://api.openai.com").replace(/\/$/, "")}/v1/responses`
-  const response = await fetch(responseEndpoint, {
+  const response = await fetch(buildOpenAiResponsesUrl(endpoint), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -13433,4 +13761,14 @@ async function requestResponsesText({ apiKey, endpoint, model, prompt, instructi
   }
   const parsed = await response.json()
   return extractTextFromResponsesJson(parsed)
+}
+
+export async function requestOpenAiProviderText({ apiKey, endpoint, apiMode, model, prompt, instructions, reasoningEffort }) {
+  const safePrompt = sanitizeTextControlCharacters(prompt)
+  const safeInstructions = sanitizeTextControlCharacters(instructions)
+  const mode = resolveOpenAiApiMode({ endpoint, apiMode })
+  if (mode === "chat") {
+    return requestChatCompletionsText({ apiKey, endpoint, model, prompt: safePrompt, instructions: safeInstructions, reasoningEffort })
+  }
+  return requestResponsesText({ apiKey, endpoint, model, prompt: safePrompt, instructions: safeInstructions, reasoningEffort })
 }

@@ -37,6 +37,20 @@ import {
   selectAskSources,
   tokenizeQuery,
   validateWikiContent,
+  buildChatCompletionsBody,
+  buildOpenAiChatCompletionsUrl,
+  buildOpenAiResponsesUrl,
+  normalizeOpenAiEndpointBase,
+  resolveOpenAiApiMode,
+  resolveOpenAiApiKey,
+  requestOpenAiProviderText,
+  sanitizeTextControlCharacters,
+  coerceWikiPageFrontmatter,
+  normalizeWikiPageContent,
+  normalizeWikiTimestamp,
+  parseModelJson,
+  validateFrontmatter,
+  applyManifest,
 } from "./codex-ingest-lib.mjs"
 
 let tmpRoot
@@ -2866,6 +2880,204 @@ describe("wiki body soft line limit", () => {
   it("accepts US stock tickers", () => {
     const content = `${validFrontmatter("美股样本", "股票", "code: AAPL\nindustry: 消费电子\n")}\n# 美股样本\n`
     expect(validateWikiContent("wiki/股票/美股样本.md", content).filter((issue) => issue.fatal)).toEqual([])
+  })
+})
+
+describe("ingest JSON and timestamp normalization", () => {
+  it("parseModelJson tolerates literal control characters inside JSON strings", () => {
+    const parsed = parseModelJson(String.raw`{"create":[{"path":"wiki/概念/x.md","why":"line1
+line2"}],"update":[],"factWrites":[]}`)
+    expect(parsed.create[0].why).toContain("line1")
+    expect(parsed.create[0].why).toContain("line2")
+  })
+
+  it("normalizeWikiTimestamp coerces ISO and YAML Date values", () => {
+    expect(normalizeWikiTimestamp("2026-06-15T14:23:07")).toBe("2026-06-15 14:23:07")
+    expect(normalizeWikiTimestamp("2026-06-15")).toBe("2026-06-15 00:00:00")
+    expect(normalizeWikiTimestamp(new Date("2026-06-15T06:23:07Z"))).toMatch(/^2026-06-15 \d{2}:\d{2}:\d{2}$/)
+  })
+
+  it("validateFrontmatter accepts YAML-parsed Date timestamps after normalization", () => {
+    const issues = validateFrontmatter({
+      schema_version: 1,
+      title: "测试页",
+      type: "概念",
+      summary: "这是一个用于测试 frontmatter 时间戳自动规范化的概念页摘要，长度需要满足 schema 对 summary 字段的最小字符要求。",
+      tags: [],
+      related: [],
+      sources: [],
+      created: new Date("2026-06-15T10:00:00"),
+      updated: "2026-06-15T14:23:07",
+      last_reviewed: "2026-06-15",
+      confidence: "中",
+      status: "活跃",
+    }, "wiki/概念/测试页.md")
+    expect(issues.filter((issue) => issue.fatal)).toEqual([])
+  })
+
+  it("sanitizeTextControlCharacters removes ASCII control bytes from source text", () => {
+    expect(sanitizeTextControlCharacters("a\u0001b\nc")).toBe("ab\nc")
+  })
+
+  it("coerceWikiPageFrontmatter fills missing schema fields from path and body", () => {
+    const coerced = coerceWikiPageFrontmatter({}, "wiki/模式/消费冷启动模式.md", "# 消费冷启动模式\n\n首段摘要内容。")
+    expect(coerced.schema_version).toBe(1)
+    expect(coerced.title).toBe("消费冷启动模式")
+    expect(coerced.type).toBe("模式")
+    expect(coerced.confidence).toBe("中")
+    expect(coerced.status).toBe("活跃")
+    expect(coerced.created).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+    expect([...coerced.summary].length).toBeGreaterThanOrEqual(50)
+  })
+
+  it("applyManifest --skip-invalid writes valid pages and skips invalid stock pages", async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-ingest-skip-"))
+    const manifestPath = path.join(tmpRoot, "changes.json")
+    await fs.mkdir(path.join(tmpRoot, "wiki/模式"), { recursive: true })
+    await fs.writeFile(manifestPath, JSON.stringify({
+      projectPath: tmpRoot,
+      writes: [
+        {
+          action: "create",
+          path: "wiki/模式/消费冷启动模式.md",
+          content: "# 消费冷启动模式\n\n这是一个模式页。",
+        },
+        {
+          action: "create",
+          path: "wiki/股票/金钼股份.md",
+          content: `---
+schema_version: 1
+title: 金钼股份
+type: 股票
+summary: 这是一个仍然缺少合法 code 字段的股票页摘要，用于测试 skip-invalid 行为，长度需要超过 schema 最小限制。
+tags: []
+related: []
+sources: []
+created: 2026-04-15
+updated: 2026-04-15
+last_reviewed: 2026-04-15
+confidence: 中
+status: 活跃
+---
+
+# 金钼股份
+`,
+        },
+      ],
+    }, null, 2), "utf8")
+
+    const result = await applyManifest({
+      manifestPath,
+      projectPath: tmpRoot,
+      write: true,
+      skipInvalid: true,
+    })
+
+    expect(result.written).toContain("wiki/模式/消费冷启动模式.md")
+    expect(result.written).not.toContain("wiki/股票/金钼股份.md")
+    expect(result.skipped.some((item) => item.path === "wiki/股票/金钼股份.md")).toBe(true)
+  })
+
+  it("normalizeWikiPageContent rewrites frontmatter timestamps to schema format", () => {
+    const normalized = normalizeWikiPageContent(`---
+schema_version: 1
+title: 测试页
+type: 概念
+summary: 这是一个用于测试 frontmatter 时间戳自动规范化的概念页摘要，长度需要满足 schema 对 summary 字段的最小字符要求。
+tags: []
+related: []
+sources: []
+created: 2026-06-15T10:00:00
+updated: 2026-06-15T14:23:07
+last_reviewed: 2026-06-15
+confidence: 中
+status: 活跃
+---
+
+# 测试页
+`, { now: "2026-06-15 14:23:07", relativePath: "wiki/概念/测试页.md" })
+    expect(normalized).toContain("created: 2026-06-15 10:00:00")
+    expect(normalized).toContain("updated: 2026-06-15 14:23:07")
+    expect(normalized).toContain("last_reviewed: 2026-06-15 00:00:00")
+  })
+})
+
+describe("OpenAI provider routing", () => {
+  it("auto-selects chat mode for DeepSeek endpoints", () => {
+    expect(resolveOpenAiApiMode({ endpoint: "https://api.deepseek.com" })).toBe("chat")
+    expect(resolveOpenAiApiMode({ endpoint: "https://api.deepseek.com/v1" })).toBe("chat")
+  })
+
+  it("auto-selects responses mode for OpenAI official endpoint", () => {
+    expect(resolveOpenAiApiMode({ endpoint: "https://api.openai.com" })).toBe("responses")
+  })
+
+  it("honors explicit api mode override", () => {
+    expect(resolveOpenAiApiMode({ endpoint: "https://api.openai.com", apiMode: "chat" })).toBe("chat")
+    expect(resolveOpenAiApiMode({ endpoint: "https://api.deepseek.com", apiMode: "responses" })).toBe("responses")
+  })
+
+  it("normalizes endpoint bases and builds chat/responses URLs", () => {
+    expect(normalizeOpenAiEndpointBase("https://api.deepseek.com/v1/chat/completions")).toBe("https://api.deepseek.com")
+    expect(buildOpenAiChatCompletionsUrl("https://api.deepseek.com")).toBe("https://api.deepseek.com/chat/completions")
+    expect(buildOpenAiResponsesUrl("https://api.openai.com")).toBe("https://api.openai.com/v1/responses")
+  })
+
+  it("builds DeepSeek chat body with thinking for v4-pro", () => {
+    const body = buildChatCompletionsBody({
+      model: "deepseek-v4-pro",
+      prompt: "hello",
+      instructions: "system",
+      reasoningEffort: "high",
+      endpoint: "https://api.deepseek.com",
+    })
+    expect(body.messages).toEqual([
+      { role: "system", content: "system" },
+      { role: "user", content: "hello" },
+    ])
+    expect(body.reasoning_effort).toBe("high")
+    expect(body.thinking).toEqual({ type: "enabled" })
+  })
+
+  it("prefers DEEPSEEK_API_KEY when endpoint is DeepSeek", () => {
+    const prevOpenAi = process.env.OPENAI_API_KEY
+    const prevDeepSeek = process.env.DEEPSEEK_API_KEY
+    delete process.env.OPENAI_API_KEY
+    process.env.DEEPSEEK_API_KEY = "ds-test-key"
+    try {
+      expect(resolveOpenAiApiKey({ endpoint: "https://api.deepseek.com" })).toBe("ds-test-key")
+    } finally {
+      if (prevOpenAi === undefined) delete process.env.OPENAI_API_KEY
+      else process.env.OPENAI_API_KEY = prevOpenAi
+      if (prevDeepSeek === undefined) delete process.env.DEEPSEEK_API_KEY
+      else process.env.DEEPSEEK_API_KEY = prevDeepSeek
+    }
+  })
+
+  it("requestOpenAiProviderText uses chat completions for DeepSeek", async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      expect(String(url)).toBe("https://api.deepseek.com/chat/completions")
+      const body = JSON.parse(String(init.body))
+      expect(body.model).toBe("deepseek-v4-flash")
+      expect(body.messages[1].content).toBe("ping")
+      return new Response(
+        JSON.stringify({ choices: [{ message: { role: "assistant", content: "pong" } }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }
+    try {
+      const text = await requestOpenAiProviderText({
+        apiKey: "ds-test",
+        endpoint: "https://api.deepseek.com",
+        model: "deepseek-v4-flash",
+        prompt: "ping",
+        instructions: "test",
+      })
+      expect(text).toBe("pong")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 })
 

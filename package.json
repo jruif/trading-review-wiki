@@ -10,7 +10,10 @@
     "test": "vitest run",
     "codex:ingest": "node scripts/codex-ingest.mjs",
     "gangtise:meeting-clues": "node scripts/gangtise-meeting-clues-report.mjs",
-    "tauri": "tauri"
+    "skill:install:hermes": "node scripts/install-hermes-skill.mjs --agent hermes",
+    "skill:install": "npm run skill:install:hermes",
+    "tauri": "tauri",
+    "build:app": "tauri build --bundles app"
   },
   "dependencies": {
     "@base-ui/react": "^1.3.0",

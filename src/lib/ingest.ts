@@ -22,11 +22,13 @@ import {
   CONFIDENCE,
   SCHEMA_VERSION,
   canonicalSampleFor,
+  coerceWikiPageFrontmatter,
   cleanSources,
   normalizeTypeAlias,
   inferTypeFromPath,
   nowLocalTimestamp,
   parseFrontmatter,
+  pathToTitle,
   serializeFrontmatter,
   validate,
   type WikiType,
@@ -56,6 +58,20 @@ interface Plan {
 }
 
 const RESERVED_PATHS = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
+
+/** Max update pages per ingest run — excess deferred to review */
+const MAX_PLAN_UPDATES = 8
+/** Parallel LLM calls in Stage 3 */
+const UPDATE_CONCURRENCY = 2
+
+const INGEST_MAX_TOKENS = {
+  analyze: 8192,
+  plan: 4096,
+  update: 8192,
+  updateFullPage: 16384,
+  create: 32768,
+  retry: 8192,
+} as const
 
 export type IngestStageLabel = "analyze" | "plan" | "update" | "create"
 
@@ -222,6 +238,7 @@ export async function autoIngest(
 
   // ── Stage 2: Plan ──────────────────────────────────────────
   let plan: Plan
+  let deferredPlanUpdates: PlanUpdateItem[] = []
   if (checkpoint.plan) {
     activity.updateStage(activityId, 2, { status: "done" })
     activity.updateItem(activityId, { detail: "Step 2/4: Reusing cached plan (resumed)" })
@@ -251,6 +268,17 @@ export async function autoIngest(
         retryOpts("Step 2/4: Planning"),
       )
       plan = await normalizePlan(pp, plan)
+      const { plan: cappedPlan, deferredUpdates } = capPlanUpdates(plan)
+      plan = cappedPlan
+      deferredPlanUpdates = deferredUpdates
+      if (deferredUpdates.length > 0) {
+        debugLog("warn", "ingest-plan", `Deferred ${deferredUpdates.length} update(s) beyond cap ${MAX_PLAN_UPDATES}`, {
+          deferred: deferredUpdates.map((u) => u.path),
+        })
+        activity.updateItem(activityId, {
+          detail: `Step 2/4: Plan ready (${deferredUpdates.length} updates deferred — see Review)`,
+        })
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       activity.updateStage(activityId, 2, { status: "error", error: msg })
@@ -323,7 +351,7 @@ export async function autoIngest(
   ]
   let allReviewBlocks = checkpoint.reviewBlocksRaw ?? ""
 
-  // ── Stage 3: Updates (one LLM call per page, with retry + checkpoint per item) ──
+  // ── Stage 3: Updates (incremental merge + parallel LLM, checkpoint per item) ──
   const pendingUpdates = plan.update
     .map((u, i) => ({ u, i }))
     .filter(({ u }) => !completedUpdates.has(u.path))
@@ -332,12 +360,15 @@ export async function autoIngest(
     activity.updateStage(activityId, 3, { status: "running" })
     activity.updateItem(activityId, {
       detail: pendingUpdates.length === plan.update.length
-        ? `Step 3/4: Updating ${plan.update.length} page(s)...`
+        ? `Step 3/4: Updating ${plan.update.length} page(s) (×${UPDATE_CONCURRENCY})...`
         : `Step 3/4: Resuming — ${pendingUpdates.length}/${plan.update.length} remaining`,
     })
     let stage3Failed = 0
-    for (const { u, i } of pendingUpdates) {
-      if (signal?.aborted) break
+
+    const processOneUpdate = async ({ u, i }: { u: PlanUpdateItem; i: number }) => {
+      if (signal?.aborted) {
+        return { ok: false as const, planItemId: `u-${i}`, path: u.path, error: "Cancelled" }
+      }
       const planItemId = `u-${i}`
       activity.updatePlanItem(activityId, planItemId, { status: "running" })
       stream?.onStageStart?.("update", `Step 3/4: 更新 ${u.path}`)
@@ -346,11 +377,20 @@ export async function autoIngest(
         if (!existingContent) {
           throw new Error(`Existing file not found: ${u.path}`)
         }
+        const updateMaxTokens = estimateUpdateMaxTokens(existingContent)
         const generation = await withRetry(
-          () => runUpdateStage(
-            llmConfig, fileName, u, existingContent, analysis, signal,
-            (token) => stream?.onStageToken?.(token, "update"),
-          ),
+          () =>
+            runUpdateStage(
+              llmConfig,
+              fileName,
+              sourceBaseName,
+              u,
+              existingContent,
+              analysis,
+              signal,
+              UPDATE_CONCURRENCY > 1 ? undefined : (token) => stream?.onStageToken?.(token, "update"),
+              updateMaxTokens,
+            ),
           {
             maxAttempts: 2,
             backoffMs: [3000],
@@ -363,46 +403,64 @@ export async function autoIngest(
             },
           },
         )
-        const { written, errors: repairErrors } = await repairAndWriteBlocks(
-          llmConfig,
-          pp,
+        const nowTs = nowLocalTimestamp()
+        const mergedContent = mergeUpdateFromLlmOutput(
+          existingContent,
           generation,
           u.path,
+          sourceBaseName,
+          nowTs,
+        )
+        const writeResult = await writeRepairedWikiPage(
+          llmConfig,
+          pp,
+          u.path,
+          mergedContent,
           signal,
           activityId,
-          (p) => (p === u.path ? planItemId : null),
+          planItemId,
         )
-        if (written.length === 0) {
-          const repairErr = repairErrors.get(u.path)
-          if (repairErr) {
-            debugLog("error", "ingest-update", `Schema validation failed for ${u.path}: ${repairErr}`)
-            throw new Error(repairErr)
-          }
-          debugLog("error", "ingest-update", `No FILE block parsed for ${u.path}`, {
-            expectedPath: u.path,
-            responseLength: generation.length,
-            responsePreview: generation.slice(0, 500),
-            fullResponse: generation,
-          })
-          throw new Error(
-            `LLM returned no FILE block (response length ${generation.length}, see debug.log)`,
-          )
+        if (!writeResult.written) {
+          throw new Error(writeResult.error ?? "Failed to write updated page")
         }
-        writtenPaths.push(...written)
-        allReviewBlocks += "\n" + generation
-        completedUpdates.add(u.path)
-        checkpoint.completedUpdates = Array.from(completedUpdates)
-        checkpoint.reviewBlocksRaw = allReviewBlocks
-        await saveCheckpoint(pp, contentHash, checkpoint)
-        activity.updatePlanItem(activityId, planItemId, { status: "done" })
         stream?.onStageEnd?.("update", `✓ ${u.path}`)
+        return {
+          ok: true as const,
+          planItemId,
+          path: u.path,
+          generation,
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         activity.updatePlanItem(activityId, planItemId, { status: "error", error: msg })
         stream?.onStageEnd?.("update", `✗ ${u.path}: ${msg}`)
+        return { ok: false as const, planItemId, path: u.path, error: msg }
+      }
+    }
+
+    const updateResults = await mapWithConcurrency(
+      pendingUpdates,
+      UPDATE_CONCURRENCY,
+      processOneUpdate,
+    )
+
+    for (const result of updateResults) {
+      if (result.ok) {
+        writtenPaths.push(result.path)
+        allReviewBlocks += `\n${result.generation}`
+        completedUpdates.add(result.path)
+        activity.updatePlanItem(activityId, result.planItemId, { status: "done" })
+      } else if (result.error !== "Cancelled") {
         stage3Failed++
       }
     }
+
+    if (completedUpdates.size > 0) {
+      checkpoint.completedUpdates = Array.from(completedUpdates)
+      checkpoint.reviewBlocksRaw = allReviewBlocks
+      await saveCheckpoint(pp, contentHash, checkpoint)
+    }
+
     activity.updateStage(activityId, 3, {
       status: stage3Failed === pendingUpdates.length && pendingUpdates.length > 0 ? "error" : "done",
       error: stage3Failed > 0 ? `${stage3Failed}/${pendingUpdates.length} 失败` : undefined,
@@ -574,6 +632,20 @@ export async function autoIngest(
   }
 
   const reviewItems = parseReviewBlocks(allReviewBlocks, sp)
+  if (deferredPlanUpdates.length > 0) {
+    reviewItems.push(
+      ...deferredPlanUpdates.map((u) => ({
+        type: "suggestion" as const,
+        title: `延后更新: ${pathToTitle(u.path)}`,
+        description:
+          u.why ??
+          `单次入库最多自动更新 ${MAX_PLAN_UPDATES} 个已有页面。请稍后对该页单独 ingest，或手动编辑 ${u.path}。`,
+        sourcePath: sp,
+        affectedPages: [u.path],
+        options: [{ label: "知道了", action: "Skip" }],
+      })),
+    )
+  }
   if (reviewItems.length > 0) {
     useReviewStore.getState().addItems(reviewItems)
   }
@@ -668,6 +740,7 @@ async function runAnalysisStage(
       },
     },
     signal,
+    { maxTokens: INGEST_MAX_TOKENS.analyze },
   )
 
   if (failed) {
@@ -721,6 +794,7 @@ async function runPlanStage(
       },
     },
     signal,
+    { maxTokens: INGEST_MAX_TOKENS.plan },
   )
 
   if (failed) {
@@ -732,11 +806,13 @@ async function runPlanStage(
 async function runUpdateStage(
   llmConfig: LlmConfig,
   fileName: string,
+  sourceBaseName: string,
   page: PlanUpdateItem,
   existingContent: string,
   analysis: string,
   signal: AbortSignal | undefined,
   onToken?: (token: string) => void,
+  maxTokens = INGEST_MAX_TOKENS.update,
 ): Promise<string> {
   let raw = ""
   let failed = false
@@ -745,7 +821,7 @@ async function runUpdateStage(
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildUpdatePrompt(page, nowLocalTimestamp()) },
+      { role: "system", content: buildUpdatePrompt(page, sourceBaseName, nowLocalTimestamp()) },
       {
         role: "user",
         content: [
@@ -753,7 +829,9 @@ async function runUpdateStage(
           page.why ?? "(no explicit reason from plan)",
           "",
           `## Existing content of ${page.path}`,
-          existingContent,
+          existingContent.length > 60000
+            ? `${existingContent.slice(0, 60000)}\n\n[...truncated for prompt — full page preserved on merge...]`
+            : existingContent,
           "",
           `## Source analysis`,
           analysis,
@@ -775,6 +853,7 @@ async function runUpdateStage(
       },
     },
     signal,
+    { maxTokens },
   )
 
   if (failed) {
@@ -836,6 +915,7 @@ async function runCreateStage(
       },
     },
     signal,
+    { maxTokens: INGEST_MAX_TOKENS.create },
   )
 
   if (failed) {
@@ -910,6 +990,141 @@ function parsePlan(rawText: string): Plan {
   return { create, update }
 }
 
+function capPlanUpdates(plan: Plan): { plan: Plan; deferredUpdates: PlanUpdateItem[] } {
+  if (plan.update.length <= MAX_PLAN_UPDATES) {
+    return { plan, deferredUpdates: [] }
+  }
+  return {
+    plan: { ...plan, update: plan.update.slice(0, MAX_PLAN_UPDATES) },
+    deferredUpdates: plan.update.slice(MAX_PLAN_UPDATES),
+  }
+}
+
+function estimateUpdateMaxTokens(existingContent: string): number {
+  // Incremental updates need far fewer output tokens; allow more if model returns full page.
+  const chars = existingContent.length
+  if (chars > 12000) return INGEST_MAX_TOKENS.updateFullPage
+  return INGEST_MAX_TOKENS.update
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return []
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex
+      nextIndex += 1
+      results[index] = await fn(items[index], index)
+    }
+  }
+
+  const workers = Math.min(Math.max(1, concurrency), items.length)
+  await Promise.all(Array.from({ length: workers }, () => worker()))
+  return results
+}
+
+export function mergeUpdateFromLlmOutput(
+  existingContent: string,
+  llmRaw: string,
+  expectedPath: string,
+  sourceBaseName: string,
+  nowTs: string,
+): string {
+  const existing = parseFrontmatter(existingContent)
+  const blocks = parseFileBlocks(llmRaw)
+  let block = blocks.find((b) => b.path === expectedPath) ?? blocks[0]
+  if (!block) {
+    const implicit = tryExtractImplicitBlock(llmRaw, expectedPath)
+    if (implicit) block = implicit
+  }
+
+  const fragment = (block?.content ?? llmRaw).trim()
+  if (!fragment) {
+    throw new Error("LLM returned empty update content")
+  }
+
+  const llmParsed = parseFrontmatter(fragment)
+  const sectionHeader = `## 来自 ${sourceBaseName} 的补充`
+  const looksLikeFullPage =
+    Boolean(block) &&
+    (llmParsed.fm.schema_version === SCHEMA_VERSION || llmParsed.fm.title) &&
+    llmParsed.body.length > 0 &&
+    llmParsed.body.length >= existing.body.length * 0.55
+
+  let mergedBody: string
+  let mergedFm: Partial<WikiFrontmatter>
+
+  if (looksLikeFullPage) {
+    mergedBody = llmParsed.body
+    mergedFm = {
+      ...existing.fm,
+      ...llmParsed.fm,
+      created: existing.fm.created ?? llmParsed.fm.created,
+      code: llmParsed.fm.code ?? existing.fm.code,
+    }
+  } else {
+    const incrementBody =
+      llmParsed.body.trim().length > 0
+        ? llmParsed.body.trim()
+        : fragment.replace(/^---[\s\S]*?---\r?\n?/, "").trim()
+    if (!incrementBody) {
+      throw new Error("LLM returned no appendable markdown sections")
+    }
+    const alreadyHasSection = existing.body.includes(sectionHeader)
+    mergedBody = alreadyHasSection
+      ? `${existing.body.trimEnd()}\n\n${incrementBody}`
+      : `${existing.body.trimEnd()}\n\n${sectionHeader}\n\n${incrementBody}`
+    mergedFm = {
+      ...existing.fm,
+      sources: cleanSources([
+        ...(Array.isArray(existing.fm.sources) ? existing.fm.sources : []),
+        sourceBaseName,
+      ]),
+      updated: nowTs,
+    }
+  }
+
+  const coerced = coerceWikiPageFrontmatter(mergedFm, expectedPath, mergedBody, { now: nowTs })
+  return serializeFrontmatter(coerced as WikiFrontmatter, mergedBody)
+}
+
+async function writeRepairedWikiPage(
+  llmConfig: LlmConfig,
+  projectPath: string,
+  relativePath: string,
+  content: string,
+  signal: AbortSignal | undefined,
+  activityId: string | null,
+  planItemId: string | null,
+): Promise<{ written: boolean; error?: string }> {
+  const activity = useActivityStore.getState()
+  const result = await repairBlock(
+    llmConfig,
+    projectPath,
+    { path: relativePath, content },
+    signal,
+    (n, max) => {
+      if (activityId && planItemId) {
+        activity.updatePlanItem(activityId, planItemId, { note: `重试中 ${n}/${max}` })
+      }
+    },
+  )
+  if (activityId && planItemId) {
+    activity.updatePlanItem(activityId, planItemId, { note: undefined })
+  }
+  if (result.error || !result.content) {
+    return { written: false, error: result.error ?? "Schema repair failed" }
+  }
+  await writeFile(`${projectPath}/${relativePath}`, result.content)
+  return { written: true }
+}
+
 /**
  * Reconcile plan with filesystem reality. Action is determined by whether
  * the file exists on disk, not by which bucket the LLM put it in.
@@ -948,17 +1163,6 @@ async function normalizePlan(pp: string, plan: Plan): Promise<Plan> {
     }
   }
   return { create, update }
-}
-
-function inferTypeFromPath(path: string): string {
-  const m = path.match(/^wiki\/([^/]+)\//)
-  return m ? m[1] : ""
-}
-
-function pathToTitle(path: string): string {
-  const base = path.replace(/^wiki\//, "").replace(/\.md$/, "")
-  const last = base.split("/").pop() ?? base
-  return last.replace(/-/g, " ")
 }
 
 // ── Prompt builders ───────────────────────────────────────────
@@ -1123,7 +1327,7 @@ function buildSchemaSection(types: WikiType[], nowTs: string): string {
   ].join("\n")
 }
 
-function buildUpdatePrompt(page: PlanUpdateItem, nowTs: string): string {
+function buildUpdatePrompt(page: PlanUpdateItem, sourceBaseName: string, nowTs: string): string {
   const type = inferTypeFromPath(page.path)
   return [
     "You are updating an existing wiki page with new information from a source.",
@@ -1132,20 +1336,19 @@ function buildUpdatePrompt(page: PlanUpdateItem, nowTs: string): string {
     "",
     "## CRITICAL RULES",
     "",
-    "1. **Preserve ALL existing content.** Every section, every fact, every [[wikilink]],",
-    "   every frontmatter field must remain. You MAY add, refine, or update wording — you",
-    "   MUST NOT delete or shorten existing content.",
-    `2. Set the \`updated\` field to \`${nowTs}\`. Preserve \`created\`.`,
-    "3. Add the source filename (without `.md`) to the `sources` array if not already present.",
-    "4. Keep `type` and `created` unchanged. If the existing frontmatter is missing required fields, fill them per the schema below.",
-    "5. Output exactly ONE FILE block containing the FULL merged page:",
+    "1. **Do NOT rewrite or repeat the existing page.** Output ONLY the new markdown sections to append.",
+    "2. The app will merge your output onto the existing page and update frontmatter programmatically.",
+    "3. Start with a section heading like `## 来自 " + sourceBaseName + " 的补充` and write only new facts, links, and evidence.",
+    "4. Use [[wikilink]] for cross-references. Do not output YAML frontmatter unless you must fix a single field.",
+    "5. Output exactly ONE FILE block:",
     "",
     "   ---FILE: " + page.path + "---",
-    "   (full updated content, including frontmatter)",
+    "   (incremental markdown sections only — NOT the full page)",
     "   ---END FILE---",
     "",
     "Do NOT output any other text outside the FILE block.",
-    "Do NOT wrap the frontmatter in ```yaml ... ``` — emit the bare `---` delimiters only.",
+    "",
+    "If the page is very small (<40 lines) you MAY output the full merged page instead, but prefer incremental sections.",
     "",
     buildSchemaSection([type], nowTs),
   ].join("\n")
@@ -1391,6 +1594,7 @@ async function runRetryRequest(
       },
     },
     signal,
+    { maxTokens: INGEST_MAX_TOKENS.retry },
   )
   if (failed) throw new Error(failMsg)
   return raw
@@ -1410,42 +1614,27 @@ async function repairBlock(
     if (signal?.aborted) return { error: "Cancelled" }
 
     const parsed = parseFrontmatter(currentContent)
-    const fm = parsed.fm
+    const priorCode = parsed.fm.code
+    const coerced = coerceWikiPageFrontmatter(parsed.fm, block.path, parsed.body, { now: nowTs })
+    let fm = coerced as Partial<WikiFrontmatter>
     const body = parsed.body
 
-    // Default schema_version
-    if (fm.schema_version == null) fm.schema_version = SCHEMA_VERSION
-
-    // Normalize type
-    if (fm.type) {
-      const norm = normalizeTypeAlias(String(fm.type))
-      if (norm) fm.type = norm
-    } else {
-      fm.type = inferTypeFromPath(block.path)
-    }
-
-    // Default last_reviewed to updated (or now) when missing
-    if (!fm.last_reviewed && fm.updated) fm.last_reviewed = fm.updated
-    if (!fm.created) fm.created = nowTs
-    if (!fm.updated) fm.updated = nowTs
-    if (!fm.last_reviewed) fm.last_reviewed = fm.updated
-
-    // Clean sources
-    if (Array.isArray(fm.sources)) {
-      fm.sources = cleanSources(fm.sources)
-    }
-
-    // Stock code DB override — LLM-written value is discarded
+    // Stock code: DB lookup, then preserve existing code from page
     if (fm.type === "股票" && typeof fm.title === "string" && fm.title.trim()) {
       try {
         const code = await lookupStockCode(projectPath, fm.title.trim())
         if (code) {
           fm.code = code
+        } else if (priorCode && typeof priorCode === "string") {
+          fm.code = priorCode
         } else {
           delete fm.code
         }
       } catch (err) {
         debugLog("warn", "ingest-stockcode", `Lookup failed for "${fm.title}": ${String(err)}`)
+        if (priorCode && typeof priorCode === "string") {
+          fm.code = priorCode
+        }
       }
     }
 

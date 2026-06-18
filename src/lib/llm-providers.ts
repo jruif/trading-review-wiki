@@ -149,7 +149,7 @@ function buildOpenAiBody(messages: ChatMessage[]): unknown {
   return { messages, stream: true }
 }
 
-function buildAnthropicBody(messages: ChatMessage[]): unknown {
+function buildAnthropicBody(messages: ChatMessage[], maxTokens = 16384): unknown {
   const systemMessages = messages.filter((m) => m.role === "system")
   const conversationMessages = messages.filter((m) => m.role !== "system")
   const system = systemMessages.map((m) => m.content).join("\n") || undefined
@@ -158,7 +158,7 @@ function buildAnthropicBody(messages: ChatMessage[]): unknown {
     messages: conversationMessages,
     ...(system !== undefined ? { system } : {}),
     stream: true,
-    max_tokens: 4096,
+    max_tokens: maxTokens,
   }
 }
 

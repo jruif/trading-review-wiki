@@ -5,6 +5,8 @@ import { useChatStore } from "@/stores/chat-store"
 import { normalizePath } from "@/lib/path-utils"
 import { makeChatStreamHooks } from "@/lib/ingest-stream-hooks"
 import { getFileName } from "@/lib/path-utils"
+import { resolveEffectiveLlmConfig } from "@/lib/project-store"
+import { formatLlmHttpError, isLlmProviderReady } from "@/lib/llm-auth"
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -253,12 +255,15 @@ async function processNext(projectPath: string): Promise<void> {
   await saveQueue(projectPath)
 
   const pp = normalizePath(projectPath)
-  const llmConfig = useWikiStore.getState().llmConfig
+  const rawConfig = useWikiStore.getState().llmConfig
+  const llmConfig = await resolveEffectiveLlmConfig(rawConfig)
+  if (llmConfig.apiKey !== rawConfig.apiKey) {
+    useWikiStore.getState().setLlmConfig(llmConfig)
+  }
 
-  // Check if LLM is configured
-  if (!llmConfig.apiKey && llmConfig.provider !== "ollama" && llmConfig.provider !== "custom") {
+  if (!isLlmProviderReady(llmConfig)) {
     next.status = "failed"
-    next.error = "LLM not configured — set API key in Settings"
+    next.error = "LLM 未配置：请在 Settings 填写 API Key 并点击保存"
     processing = false
     await saveQueue(pp)
     processNext(pp)
@@ -304,7 +309,8 @@ async function processNext(projectPath: string): Promise<void> {
     console.log(`[Ingest Queue] Done: ${next.sourcePath}`)
   } catch (err) {
     currentTask = null
-    const message = err instanceof Error ? err.message : String(err)
+    const rawMessage = err instanceof Error ? err.message : String(err)
+    const message = formatLlmHttpError(rawMessage, llmConfig)
     next.retryCount++
     next.error = message
 

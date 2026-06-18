@@ -38,10 +38,9 @@ flowchart TD
 
 关键入口：
 
-- 技能入口：`/Users/jiegege/.codex/skills/trading-wiki-ask/scripts/tw-ask.sh`
-- CLI 分发：`/Users/jiegege/Downloads/trading-review-wiki-0.10.311/scripts/codex-ingest.mjs`
-- 核心实现：`/Users/jiegege/Downloads/trading-review-wiki-0.10.311/scripts/codex-ingest-lib.mjs`
-- 实时知识库：`/Users/jiegege/Desktop/杰杰杰`
+- 技能入口：`../scripts/tw-ask.sh`
+- CLI 分发：`../scripts/codex-ingest.mjs`
+- 核心实现：`../scripts/codex-ingest-lib.mjs`
 
 ## 2. Source 注册层
 
@@ -593,7 +592,7 @@ src/lib/embedding.ts
 ### 13.1 看源路由
 
 ```sh
-/Users/jiegege/.codex/skills/trading-wiki-ask/scripts/tw-ask.sh \
+./skills/trading-wiki-ask/scripts/tw-ask.sh \
   --query "你的问题" \
   --show-sources
 ```
@@ -601,7 +600,7 @@ src/lib/embedding.ts
 ### 13.2 看完整上下文
 
 ```sh
-/Users/jiegege/.codex/skills/trading-wiki-ask/scripts/tw-ask.sh \
+./skills/trading-wiki-ask/scripts/tw-ask.sh \
   --query "你的问题" \
   --sources wiki,raw,graph,brain \
   --show-context
@@ -610,7 +609,7 @@ src/lib/embedding.ts
 ### 13.3 强制 wiki/raw/graph
 
 ```sh
-/Users/jiegege/.codex/skills/trading-wiki-ask/scripts/tw-ask.sh \
+./skills/trading-wiki-ask/scripts/tw-ask.sh \
   --query "最近一周机器人产业链有哪些变化" \
   --sources wiki,raw,graph \
   --top-wiki 16 \
@@ -623,7 +622,7 @@ src/lib/embedding.ts
 ### 13.4 加 brain memory
 
 ```sh
-/Users/jiegege/.codex/skills/trading-wiki-ask/scripts/tw-ask.sh \
+./skills/trading-wiki-ask/scripts/tw-ask.sh \
   --query "最近我在高开接盘上犯过什么错误" \
   --sources wiki,raw,graph,brain \
   --show-context
@@ -632,7 +631,7 @@ src/lib/embedding.ts
 ### 13.5 股价 / 量价验证
 
 ```sh
-/Users/jiegege/.codex/skills/trading-wiki-ask/scripts/tw-ask.sh \
+./skills/trading-wiki-ask/scripts/tw-ask.sh \
   --query "绿的谐波最近20个交易日涨跌幅、成交额和量能变化" \
   --sources wiki,raw,graph,stock-price \
   --show-context
@@ -641,7 +640,7 @@ src/lib/embedding.ts
 ### 13.6 只查 SQL
 
 ```sh
-/Users/jiegege/.codex/skills/trading-wiki-ask/scripts/tw-ask.sh \
+./skills/trading-wiki-ask/scripts/tw-ask.sh \
   --query "688017 最近20个交易日日线和成交额" \
   --sources stock-price \
   --show-context

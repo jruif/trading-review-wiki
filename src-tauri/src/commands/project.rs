@@ -3,6 +3,7 @@ use std::path::Path;
 
 use chrono::Local;
 
+use crate::clip_server;
 use crate::path_guard;
 use crate::types::wiki::WikiProject;
 
@@ -231,6 +232,7 @@ related: []
         path: root.to_string_lossy().to_string(),
     };
     path_guard::register_project_root(&project.path)?;
+    clip_server::register_opened_project(&project.name, &project.path);
     Ok(project)
 }
 
@@ -268,6 +270,7 @@ pub fn open_project(path: String) -> Result<WikiProject, String> {
 
     let project = WikiProject { name, path };
     path_guard::register_project_root(&project.path)?;
+    clip_server::register_opened_project(&project.name, &project.path);
     Ok(project)
 }
 

@@ -95,8 +95,12 @@ async function checkConnection() {
       }
       statusBar.className = "status connected";
       statusBar.textContent = "✓ Connected to LLM Wiki";
-      await loadProjects();
-      return true;
+      const hasProjects = await refreshProjectsUntilReady();
+      if (!hasProjects) {
+        statusBar.className = "status error";
+        statusBar.textContent = "✓ Connected — open a wiki in the app, then reopen this popup";
+      }
+      return hasProjects;
     }
   } catch {}
   statusBar.className = "status disconnected";
@@ -122,7 +126,8 @@ async function loadProjects() {
         if (proj.current) opt.selected = true;
         projectSelect.appendChild(opt);
       }
-      return;
+      clipBtn.disabled = false;
+      return true;
     }
   } catch {}
   // Fallback to current project
@@ -134,14 +139,28 @@ async function loadProjects() {
     const data = await res.json();
     if (data.ok && data.path) {
       const name = data.path.replace(/\\/g, "/").split("/").pop() || data.path;
+      projectSelect.innerHTML = "";
       const opt = document.createElement("option");
       opt.value = data.path;
       opt.textContent = name;
       projectSelect.appendChild(opt);
+      clipBtn.disabled = false;
+      return true;
     }
-  } catch {
-    projectSelect.innerHTML = '<option value="">No projects</option>';
+  } catch {}
+  projectSelect.innerHTML = '<option value="">No projects — open a wiki in the app first</option>';
+  clipBtn.disabled = true;
+  return false;
+}
+
+async function refreshProjectsUntilReady(maxAttempts = 30) {
+  for (let i = 0; i < maxAttempts; i++) {
+    const ok = await loadProjects();
+    if (ok) return true;
+    await new Promise((r) => setTimeout(r, 500));
   }
+  await loadProjects();
+  return false;
 }
 
 async function extractContent() {
@@ -250,7 +269,9 @@ async function extractContent() {
         contentPreview.textContent = "📝 " + result.excerpt + "\n\n---\n\n" + extractedContent;
       }
 
-      clipBtn.disabled = false;
+      if (projectSelect.value) {
+        clipBtn.disabled = false;
+      }
     } else {
       await fallbackExtract(tab.id);
     }
@@ -280,7 +301,9 @@ async function fallbackExtract(tabId) {
   if (results?.[0]?.result) {
     extractedContent = results[0].result;
     contentPreview.textContent = extractedContent;
-    clipBtn.disabled = false;
+    if (projectSelect.value) {
+      clipBtn.disabled = false;
+    }
   } else {
     contentPreview.textContent = "Failed to extract content";
   }

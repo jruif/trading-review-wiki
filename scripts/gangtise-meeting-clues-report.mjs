@@ -1,15 +1,11 @@
 import fs from "node:fs/promises"
 import path from "node:path"
-import { pathToFileURL } from "node:url"
 import { createRequire } from "node:module"
 import { stringify as stringifyYaml } from "yaml"
 
 const require = createRequire(import.meta.url)
-const gangtiseAutomationRequire = createRequire("/Users/jiegege/.codex/automations/gangtise-schema/package.json")
+const DEFAULT_MEETING_CLUES_RAW_SUBDIR = path.join("raw", "研报新闻", "投研线索")
 
-const OUTPUT_DIR = "/Users/jiegege/Desktop/杰杰杰/raw/研报新闻/投研线索"
-const TEMP_PG_NODE_MODULES = "/private/tmp/codex-gangtise-meeting-clues/node_modules"
-const FALLBACK_DB_CONFIG_PATH = "/Users/jiegege/.codex/automations/gangtise-schema/db-config.json"
 const DEFAULT_CONFIG = {
   schema: "public",
   table: "gangtise_meeting_clues",
@@ -63,9 +59,37 @@ function getRunTimestamps(pubDateOverride) {
   }
 }
 
-function readPubDateOverride() {
-  const argDate = process.argv.find((arg) => arg.startsWith("--date="))?.slice("--date=".length)
-  const pubDate = argDate || process.env.GANGTISE_MEETING_CLUES_DATE
+function parseCliArgs(argv) {
+  const args = {}
+  for (const arg of argv) {
+    if (arg.startsWith("--date=")) args.date = arg.slice("--date=".length)
+    if (arg.startsWith("--project=")) args.project = arg.slice("--project=".length)
+    if (arg.startsWith("--output=")) args.output = arg.slice("--output=".length)
+  }
+  return args
+}
+
+function resolveProjectPath(cliProject) {
+  const candidate =
+    cliProject?.trim() ||
+    process.env.GANGTISE_MEETING_CLUES_PROJECT?.trim() ||
+    process.env.TRADING_WIKI_PROJECT?.trim()
+  if (!candidate) {
+    throw new Error(
+      "Missing wiki project path. Pass --project=<path>, or set GANGTISE_MEETING_CLUES_PROJECT / TRADING_WIKI_PROJECT.",
+    )
+  }
+  return path.resolve(candidate)
+}
+
+function resolveOutputDir(cliOutput, projectPath) {
+  const explicit = cliOutput?.trim() || process.env.GANGTISE_MEETING_CLUES_OUTPUT_DIR?.trim()
+  if (explicit) return path.resolve(explicit)
+  return path.join(projectPath, DEFAULT_MEETING_CLUES_RAW_SUBDIR)
+}
+
+function readPubDateOverride(cliDate) {
+  const pubDate = cliDate || process.env.GANGTISE_MEETING_CLUES_DATE
   if (!pubDate) return null
   if (!/^\d{4}-\d{2}-\d{2}$/.test(pubDate)) {
     throw new Error(`Invalid date override: ${pubDate}. Expected YYYY-MM-DD.`)
@@ -129,10 +153,10 @@ function renderSection(title, body) {
   return `#### ${title}\n\n${clean}\n`
 }
 
-function renderMarkdown(rows, meta) {
+function renderMarkdown(rows, meta, dbConfig) {
   const topicIndex = collectTopicIndex(rows)
   const frontmatter = {
-    source: `${DEFAULT_CONFIG.database}.${DEFAULT_CONFIG.schema}.${DEFAULT_CONFIG.table}`,
+    source: `${dbConfig.database}.${dbConfig.schema}.${dbConfig.table}`,
     pub_date: meta.pubDate,
     time_zone: DEFAULT_CONFIG.timeZone,
     record_count: rows.length,
@@ -189,28 +213,25 @@ function renderMarkdown(rows, meta) {
 }
 
 async function loadPgClient() {
-  const attempts = [
-    () => require("pg"),
-    () => gangtiseAutomationRequire("pg"),
-    async () => import(pathToFileURL(path.join(TEMP_PG_NODE_MODULES, "pg", "lib", "index.js")).href),
-  ]
-  for (const attempt of attempts) {
-    try {
-      const mod = await attempt()
-      return mod.Client ?? mod.default?.Client ?? mod.default ?? mod
-    } catch {}
+  try {
+    const mod = require("pg")
+    return mod.Client ?? mod.default?.Client ?? mod.default ?? mod
+  } catch {
+    throw new Error("Missing PostgreSQL client. Run `npm install` in the repo root.")
   }
-  throw new Error(`Missing PostgreSQL client. Install it temporarily with: npm install --prefix /private/tmp/codex-gangtise-meeting-clues pg`)
 }
 
 async function readLocalDbConfig() {
-  const configPath = process.env.PG_SHIHAO_CONFIG_PATH || FALLBACK_DB_CONFIG_PATH
+  const configPath = process.env.PG_SHIHAO_CONFIG_PATH?.trim()
+  if (!configPath) return {}
   try {
-    const rawConfig = await fs.readFile(configPath, "utf8")
+    const rawConfig = await fs.readFile(path.resolve(configPath), "utf8")
     const config = JSON.parse(rawConfig)
     return config && typeof config === "object" && !Array.isArray(config) ? config : {}
-  } catch {}
-  return {}
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    throw new Error(`PG_SHIHAO_CONFIG_PATH unreadable (${configPath}): ${message}`)
+  }
 }
 
 async function loadDbConfig() {
@@ -231,9 +252,11 @@ async function loadDbConfig() {
   if (!config.user) missing.push("PG_SHIHAO_USER")
   if (!config.password) missing.push("PG_SHIHAO_PASSWORD")
   if (!config.database) missing.push("PG_SHIHAO_DATABASE")
-  if (!config.schema) missing.push("PG_SHIHAO_SCHEMA")
-  if (!config.table) missing.push("GANGTISE_MEETING_CLUES_TABLE")
-  if (missing.length > 0) throw new Error(`${missing.join(", ")} is not set, and no complete local Gangtise DB config was found.`)
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing PostgreSQL config: ${missing.join(", ")}. Set these env vars directly, or provide PG_SHIHAO_CONFIG_PATH with host/port/user/password/database.`,
+    )
+  }
   return config
 }
 
@@ -266,25 +289,28 @@ async function fetchRows({ config, startAt, endAt }) {
   }
 }
 
-async function ensureOutputDir() {
-  await fs.mkdir(OUTPUT_DIR, { recursive: true })
+async function ensureOutputDir(outputDir) {
+  await fs.mkdir(outputDir, { recursive: true })
 }
 
-async function writeMarkdown(content, meta) {
+async function writeMarkdown(content, meta, outputDir) {
   const fileName = `${meta.pubDate}-${meta.runClock}-gangtise-meeting-clues.md`
-  const filePath = path.join(OUTPUT_DIR, fileName)
+  const filePath = path.join(outputDir, fileName)
   await fs.writeFile(filePath, content, "utf8")
   return { fileName, filePath }
 }
 
 async function main() {
+  const cliArgs = parseCliArgs(process.argv.slice(2))
+  const projectPath = resolveProjectPath(cliArgs.project)
+  const outputDir = resolveOutputDir(cliArgs.output, projectPath)
   const dbConfig = await loadDbConfig()
 
-  const meta = getRunTimestamps(readPubDateOverride())
+  const meta = getRunTimestamps(readPubDateOverride(cliArgs.date))
   const rows = await fetchRows({ config: dbConfig, startAt: meta.startAt, endAt: meta.endAt })
-  await ensureOutputDir()
-  const markdown = renderMarkdown(rows, meta)
-  const written = await writeMarkdown(markdown, meta)
+  await ensureOutputDir(outputDir)
+  const markdown = renderMarkdown(rows, meta, dbConfig)
+  const written = await writeMarkdown(markdown, meta, outputDir)
   const minPubTime = rows.length ? formatBeijingTimestamp(rows[0].pub_time) : null
   const maxPubTime = rows.length ? formatBeijingTimestamp(rows[rows.length - 1].pub_time) : null
   const report = {

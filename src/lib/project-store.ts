@@ -34,7 +34,7 @@ async function migratePlaintextField<T extends Record<string, unknown>>(
     return { rest: rest as Omit<T, typeof field>, secret: value }
   } catch (err) {
     console.warn(
-      `[project-store] Failed to migrate ${String(field)} to keychain; keeping plaintext in store`,
+      `[project-store] Failed to migrate ${String(field)} to secure storage; keeping plaintext in store`,
       err,
     )
     return null
@@ -72,15 +72,28 @@ export async function addToRecentProjects(
 const LLM_CONFIG_KEY = "llmConfig"
 type StoredLlmConfig = Omit<LlmConfig, "apiKey">
 
-export async function saveLlmConfig(config: LlmConfig): Promise<void> {
+export async function saveLlmConfig(config: LlmConfig): Promise<LlmConfig> {
   const store = await getStore()
-  const { apiKey, ...rest } = config
-  if (apiKey) {
-    await storeSecret(SECRET_KEYS.llmApiKey, apiKey)
+  let { apiKey, ...rest } = config
+  const trimmed = apiKey.trim()
+  if (trimmed) {
+    await storeSecret(SECRET_KEYS.llmApiKey, trimmed)
+    apiKey = trimmed
   } else {
-    await deleteSecret(SECRET_KEYS.llmApiKey)
+    // Empty field means "unchanged" — never wipe an existing keychain secret on save.
+    apiKey = (await loadSecret(SECRET_KEYS.llmApiKey)) ?? ""
   }
   await store.set(LLM_CONFIG_KEY, rest)
+  return { ...(rest as StoredLlmConfig), apiKey }
+}
+
+/** Merge in-memory config with keychain secret (store may have empty apiKey after partial save). */
+export async function resolveEffectiveLlmConfig(config: LlmConfig): Promise<LlmConfig> {
+  if (config.provider === "ollama") return config
+  const trimmed = config.apiKey.trim()
+  if (trimmed) return { ...config, apiKey: trimmed }
+  const fromSecret = (await loadSecret(SECRET_KEYS.llmApiKey)) ?? ""
+  return { ...config, apiKey: fromSecret }
 }
 
 export async function loadLlmConfig(): Promise<LlmConfig | null> {

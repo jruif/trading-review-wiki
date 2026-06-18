@@ -7,8 +7,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
 import { copyFile, grantReadPath, grantReadDirectory, listDirectory, readFile, readFileBinary, writeFile, deleteFile, findRelatedWikiPages, preprocessFile, createDirectory, parseTradeExcel as parseTradeExcelBackend } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
-import { startIngest } from "@/lib/ingest"
-import { enqueueIngest, enqueueBatch } from "@/lib/ingest-queue"
+import { enqueueIngest, enqueueBatch, getQueue } from "@/lib/ingest-queue"
 import { parseTradeCSV, parseTradeRecords, parseTradeExcel, groupRecordsByDate, buildTradeMarkdown, buildTradeSummaryForReview, calculateFifoPnL, generateImportPreview, parseTradeRecordsWithMapping, detectEncoding } from "@/lib/trade-import"
 import type { ImportPreview, ColumnType } from "@/lib/trade-import"
 import { TradeImportPreview } from "./trade-import-preview"
@@ -17,6 +16,8 @@ import { parseTradeMarkdown as parseTradeMarkdownStats } from "@/lib/trade-stats
 import { useTranslation } from "react-i18next"
 import { normalizePath, getFileName } from "@/lib/path-utils"
 import { appendDailyLog } from "@/lib/wiki-housekeeping"
+import { resolveEffectiveLlmConfig } from "@/lib/project-store"
+import { isLlmProviderReady } from "@/lib/llm-auth"
 
 export function SourcesView() {
   const { t } = useTranslation()
@@ -26,11 +27,11 @@ export function SourcesView() {
   const setActiveView = useWikiStore((s) => s.setActiveView)
   const setFileContent = useWikiStore((s) => s.setFileContent)
   const setFileTree = useWikiStore((s) => s.setFileTree)
-  const setChatExpanded = useWikiStore((s) => s.setChatExpanded)
   const llmConfig = useWikiStore((s) => s.llmConfig)
   const [sources, setSources] = useState<FileNode[]>([])
   const [importing, setImporting] = useState(false)
-  const [ingestingPath, setIngestingPath] = useState<string | null>(null)
+  /** Force re-render when ingest queue changes */
+  const [, setQueueVersion] = useState(0)
 
   // Trade import preview state
   const [previewOpen, setPreviewOpen] = useState(false)
@@ -59,6 +60,17 @@ export function SourcesView() {
   useEffect(() => {
     loadSources()
   }, [loadSources])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setQueueVersion((v) => v + 1), 800)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  function getIngestQueueStatus(sourcePath: string): "idle" | "pending" | "processing" | "failed" {
+    const task = getQueue().find((t) => t.sourcePath === sourcePath)
+    if (!task) return "idle"
+    return task.status === "done" ? "idle" : task.status
+  }
 
   async function handleImport() {
     if (!project) return
@@ -610,16 +622,32 @@ export function SourcesView() {
   }
 
   async function handleIngest(node: FileNode) {
-    if (!project || ingestingPath) return
-    setIngestingPath(node.path)
+    if (!project) return
+    if (node.is_dir) return
+
+    const status = getIngestQueueStatus(node.path)
+    if (status === "pending" || status === "processing") return
+
+    if (!isLlmProviderReady(llmConfig)) {
+      const effective = await resolveEffectiveLlmConfig(llmConfig)
+      if (effective.apiKey !== llmConfig.apiKey) {
+        useWikiStore.getState().setLlmConfig(effective)
+      }
+      if (!isLlmProviderReady(effective)) {
+        window.alert(t("sources.llmRequired", "请先在 Settings 中配置 LLM API Key，再提取到 Wiki。"))
+        useWikiStore.getState().setActiveView("settings")
+        return
+      }
+    }
+
+    const pp = normalizePath(project.path)
     try {
-      setChatExpanded(true)
-      setActiveView("wiki")
-      await startIngest(normalizePath(project.path), node.path, llmConfig)
+      await enqueueIngest(pp, node.path)
+      setQueueVersion((v) => v + 1)
     } catch (err) {
-      console.error("Failed to start ingest:", err)
-    } finally {
-      setIngestingPath(null)
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error("Failed to enqueue ingest:", err)
+      window.alert(t("sources.ingestFailed", { defaultValue: "提取失败：{{msg}}", msg }))
     }
   }
 
@@ -673,7 +701,7 @@ export function SourcesView() {
               onOpen={handleOpenSource}
               onIngest={handleIngest}
               onDelete={handleDelete}
-              ingestingPath={ingestingPath}
+              getIngestStatus={getIngestQueueStatus}
               depth={0}
             />
           </div>
@@ -767,16 +795,17 @@ function SourceTree({
   onOpen,
   onIngest,
   onDelete,
-  ingestingPath,
+  getIngestStatus,
   depth,
 }: {
   nodes: FileNode[]
   onOpen: (node: FileNode) => void
   onIngest: (node: FileNode) => void
   onDelete: (node: FileNode) => void
-  ingestingPath: string | null
+  getIngestStatus: (path: string) => "idle" | "pending" | "processing" | "failed"
   depth: number
 }) {
+  const { t } = useTranslation()
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
 
   const toggle = (path: string) => {
@@ -819,13 +848,16 @@ function SourceTree({
                   onOpen={onOpen}
                   onIngest={onIngest}
                   onDelete={onDelete}
-                  ingestingPath={ingestingPath}
+                  getIngestStatus={getIngestStatus}
                   depth={depth + 1}
                 />
               )}
             </div>
           )
         }
+
+        const ingestStatus = getIngestStatus(node.path)
+        const ingestBusy = ingestStatus === "pending" || ingestStatus === "processing"
 
         return (
           <div
@@ -844,11 +876,22 @@ function SourceTree({
               variant="ghost"
               size="icon"
               className="h-7 w-7 shrink-0"
-              title="提取到 Wiki"
-              disabled={ingestingPath === node.path}
-              onClick={() => onIngest(node)}
+              title={
+                ingestStatus === "processing"
+                  ? "正在提取..."
+                  : ingestStatus === "pending"
+                    ? "排队中..."
+                    : ingestStatus === "failed"
+                      ? "上次提取失败，点击重试"
+                      : t("sources.ingest", "提取到 Wiki")
+              }
+              disabled={ingestBusy}
+              onClick={(e) => {
+                e.stopPropagation()
+                void onIngest(node)
+              }}
             >
-              <BookOpen className="h-4 w-4" />
+              <BookOpen className={`h-4 w-4 ${ingestBusy ? "animate-pulse text-primary" : ""}`} />
             </Button>
             <Button
               variant="ghost"
